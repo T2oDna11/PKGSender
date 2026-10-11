@@ -1,0 +1,99 @@
+name: Build PKG Sender IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Find and Create App Icon Assets
+        run: |
+          echo "Searching for PKG Sender app icon..."
+
+          ICON_FILE=$(find . -type f -iname "PKGSender_AppIcon_1024.png" | head -n 1)
+
+          if [ -z "$ICON_FILE" ]; then
+            echo "ERROR: PKGSender_AppIcon_1024.png was not found."
+            echo "Files available in repository:"
+            find . -type f
+            exit 1
+          fi
+
+          echo "Found icon at: $ICON_FILE"
+
+          mkdir -p PKGSender/Assets.xcassets/AppIcon.appiconset
+
+          cp "$ICON_FILE" \
+            PKGSender/Assets.xcassets/AppIcon.appiconset/AppIcon.png
+
+          cat > PKGSender/Assets.xcassets/Contents.json <<'EOF'
+          {
+            "info": {
+              "author": "xcode",
+              "version": 1
+            }
+          }
+          EOF
+
+          cat > PKGSender/Assets.xcassets/AppIcon.appiconset/Contents.json <<'EOF'
+          {
+            "images": [
+              {
+                "filename": "AppIcon.png",
+                "idiom": "universal",
+                "platform": "ios",
+                "size": "1024x1024"
+              }
+            ],
+            "info": {
+              "author": "xcode",
+              "version": 1
+            }
+          }
+          EOF
+
+          echo "App icon assets created successfully."
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build App
+        run: |
+          xcodebuild \
+            -project PKGSender.xcodeproj \
+            -scheme PKGSender \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon
+
+      - name: Create IPA
+        run: |
+          rm -rf Payload
+          mkdir -p Payload
+
+          cp -R \
+            build/Build/Products/Release-iphoneos/PKGSender.app \
+            Payload/
+
+          zip -r PKGSender-unsigned.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: PKGSender-IPA
+          path: PKGSender-unsigned.ipa

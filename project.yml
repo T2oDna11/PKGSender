@@ -1,0 +1,19 @@
+name: PKGSender
+options:
+  bundleIdPrefix: com.mrw
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  PKGSender:
+    type: application
+    platform: iOS
+    sources:
+      - PKGSender
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.mrw.PKGSender
+      INFOPLIST_FILE: PKGSender/Info.plist
+      SWIFT_VERSION: 5.0
+      TARGETED_DEVICE_FAMILY: "1,2"
+      CODE_SIGN_STYLE: Manual
+      CODE_SIGNING_ALLOWED: NO
+      CODE_SIGNING_REQUIRED: NO
