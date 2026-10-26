@@ -13,6 +13,7 @@ struct TransferHistoryItem: Identifiable, Codable {
     let totalBytes: UInt64
     let transferredBytes: UInt64
     let averageSpeed: Double
+    let peakSpeed: Double?
     let duration: Double
     let date: Date
     let completed: Bool
@@ -31,6 +32,7 @@ struct TransferHistoryItem: Identifiable, Codable {
         totalBytes: UInt64,
         transferredBytes: UInt64,
         averageSpeed: Double,
+        peakSpeed: Double? = nil,
         duration: Double,
         date: Date = Date(),
         completed: Bool,
@@ -47,6 +49,7 @@ struct TransferHistoryItem: Identifiable, Codable {
         self.totalBytes = totalBytes
         self.transferredBytes = transferredBytes
         self.averageSpeed = averageSpeed
+        self.peakSpeed = peakSpeed
         self.duration = duration
         self.date = date
         self.completed = completed
@@ -202,6 +205,13 @@ struct ContentView: View {
     @State private var checkedIP = ""
     @State private var checkedPort = ""
 
+    private enum TransferMode: String {
+        case wifi
+        case usb
+    }
+
+    @State private var transferMode: TransferMode = .wifi
+
     // MARK: File / Server
 
     @State private var selectedFile: URL?
@@ -216,7 +226,7 @@ struct ContentView: View {
     @State private var queueItemSpeed: [UUID: Double] = [:]
     @State private var queueItemSentBytes: [UUID: UInt64] = [:]
     @State private var queueItemTotalBytes: [UUID: UInt64] = [:]
-    @State private var server: LocalHTTPServer?
+    @State private var server: (any PKGHTTPServing)?
 
     @State private var status = ""
     @State private var showFilePicker = false
@@ -247,6 +257,8 @@ struct ContentView: View {
     @State private var transferStartDate: Date?
     @State private var speedSamplesTotal: Double = 0
     @State private var speedSamplesCount: Int = 0
+    @State private var peakSpeed: Double = 0
+    @State private var showCancelConfirmation = false
     @State private var historySavedForTransfer = false
     @State private var currentHistoryBatchID: UUID?
 
@@ -254,7 +266,7 @@ struct ContentView: View {
     @State private var libraryDetailsPackages: [LibraryPackage]? = nil
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        Group {
             Group {
                 switch selectedMainTab {
                 case .home:
@@ -265,7 +277,9 @@ struct ContentView: View {
                     LibraryView(
                         store: libraryStore,
                         appLanguage: appLanguage,
+                        psIP: psIP,
                         detailsPackages: $libraryDetailsPackages,
+                        historyItems: historyStore.items,
                         onSendPackage: { package in sendLibraryPackage(package) },
                         onQueuePackage: { package in queueLibraryPackage(package) },
                         onGoHome: {
@@ -277,15 +291,20 @@ struct ContentView: View {
                         isPackageSent: { package in libraryPackageWasSent(package) },
                         isPackageQueued: { package in libraryPackageIsQueued(package) }
                     )
+                case .tools:
+                    ToolsView(appLanguage: appLanguage, psIP: psIP)
                 case .settings:
                     SettingsView(appLanguage: $appLanguage, psPort: $psPort)
                 }
             }
-            PKGBottomTabBar(selectedTab: $selectedMainTab, isArabic: isArabic)
-                .padding(.horizontal, 18)
-                .padding(.bottom, 8)
-                .blur(radius: libraryDetailsPackages == nil ? 0 : 7)
-                .allowsHitTesting(libraryDetailsPackages == nil)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if libraryDetailsPackages == nil {
+                PKGBottomTabBar(selectedTab: $selectedMainTab, isArabic: isArabic)
+                    .padding(.horizontal, 18)
+                    .padding(.top, 6)
+                    .padding(.bottom, 8)
+            }
         }
         .environment(\.layoutDirection, layoutDirection)
         .blur(radius: hasCompletedFirstLaunch ? 0 : 8)
@@ -303,6 +322,9 @@ struct ContentView: View {
         .overlay {
             packageQueueOverlay
         }
+        .overlay {
+            cancelConfirmationOverlay
+        }
     }
 
     private var homeTab: some View {
@@ -313,7 +335,10 @@ struct ContentView: View {
                         title: t("Home", "الرئيسية"),
                         subtitle: "PKG Sender"
                     )
-                    connectionCard
+                    transferModeCard
+                    if transferMode == .wifi {
+                        connectionCard
+                    }
                     fileCard
 
                     if isSending || progress > 0 || wasCancelled {
@@ -366,9 +391,122 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
+    private var cancelConfirmationOverlay: some View {
+        if showCancelConfirmation {
+            ZStack {
+                Color.black.opacity(0.28)
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        withAnimation(.easeOut(duration: 0.18)) {
+                            showCancelConfirmation = false
+                        }
+                    }
+
+                VStack(spacing: 14) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.red.opacity(0.12))
+                            .frame(width: 46, height: 46)
+                        Image(systemName: "exclamationmark")
+                            .font(.system(size: 20, weight: .bold))
+                            .foregroundColor(.red)
+                    }
+
+                    VStack(spacing: 6) {
+                        Text(t("Stop this transfer?", "إيقاف هذا النقل؟"))
+                            .font(.system(size: 19, weight: .bold, design: .rounded))
+                        Text(t(
+                            "The current transfer will stop and cannot be resumed from PKG Sender.",
+                            "سيتوقف النقل الحالي ولا يمكن استكماله من PKG Sender."
+                        ))
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                    }
+
+                    Button {
+                        withAnimation(.easeOut(duration: 0.18)) {
+                            showCancelConfirmation = false
+                        }
+                    } label: {
+                        HStack(spacing: 7) {
+                            Image(systemName: "arrow.right.circle.fill")
+                            Text(t("Keep Transfer Running", "الإبقاء على النقل"))
+                        }
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 48)
+                        .background(
+                            RoundedRectangle(cornerRadius: 15, style: .continuous)
+                                .fill(Color.accentColor)
+                        )
+                        .foregroundColor(.white)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        showCancelConfirmation = false
+                        cancelTransfer()
+                    } label: {
+                        Text(t("Cancel Transfer", "إلغاء النقل"))
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(.red)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 36)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(18)
+                .frame(maxWidth: 330)
+                .background(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .fill(Color(.secondarySystemGroupedBackground))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                )
+                .padding(.horizontal, 28)
+                .transition(.scale(scale: 0.96).combined(with: .opacity))
+            }
+            .zIndex(1000)
+        }
+    }
+
     // ======================================================
     // MARK: - PlayStation Card
     // ======================================================
+
+    private var transferModeCard: some View {
+        HStack(spacing: 8) {
+            modeButton(.wifi, title: t("Wi-Fi", "واي فاي"), icon: "wifi")
+            modeButton(.usb, title: "USB", icon: "cable.connector")
+        }
+        .padding(5)
+        .background(cardBackground)
+    }
+
+    private func modeButton(_ mode: TransferMode, title: String, icon: String) -> some View {
+        Button {
+            guard !isSending else { return }
+            transferMode = mode
+            USBBridgeServer.shared.disarm()
+            status = mode == .usb
+                ? t("USB mode ready. Choose a PKG, then tap Send.", "وضع USB جاهز. اختر ملف PKG ثم اضغط إرسال.")
+                : t("Wi-Fi mode ready. Check the PlayStation connection.", "وضع الواي فاي جاهز. افحص اتصال البلايستيشن.")
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                Text(title).fontWeight(.semibold)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 10)
+            .background(transferMode == mode ? Color.accentColor.opacity(0.16) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+        }
+        .buttonStyle(.plain)
+    }
 
     private var connectionCard: some View {
 
@@ -790,10 +928,10 @@ struct ContentView: View {
         )
 
         DispatchQueue
-            .global()
+            .global(qos: .userInitiated)
             .asyncAfter(
                 deadline:
-                    .now() + 3
+                    .now() + 6
             ) {
 
                 finish(
@@ -855,7 +993,7 @@ struct ContentView: View {
             if packageQueue.isEmpty {
 
                 Button {
-                    if !isSending && connectionIsValid {
+                    if !isSending && (transferMode == .usb || connectionIsValid) {
                         pickerAddsToQueue = false
                         showFilePicker = true
                     }
@@ -863,12 +1001,12 @@ struct ContentView: View {
                     HStack(spacing: 14) {
                         ZStack {
                             RoundedRectangle(cornerRadius: 12)
-                                .fill(connectionIsValid ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.10))
+                                .fill((transferMode == .usb || connectionIsValid) ? Color.accentColor.opacity(0.12) : Color.secondary.opacity(0.10))
                                 .frame(width: 48, height: 48)
 
                             Image(systemName: "shippingbox.fill")
                                 .font(.title3)
-                                .foregroundColor(connectionIsValid ? .accentColor : .secondary)
+                                .foregroundColor((transferMode == .usb || connectionIsValid) ? .accentColor : .secondary)
                         }
 
                         VStack(alignment: .leading, spacing: 4) {
@@ -876,17 +1014,19 @@ struct ContentView: View {
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
 
-                            Text(connectionIsValid
-                                 ? t("Tap to select one or more packages", "\u{627}\u{636}\u{63A}\u{637} \u{644}\u{627}\u{62E}\u{62A}\u{64A}\u{627}\u{631} \u{645}\u{644}\u{641} \u{623}\u{648} \u{639}\u{62F}\u{629} \u{645}\u{644}\u{641}\u{627}\u{62A}")
-                                 : t("Check the PlayStation connection first", "\u{627}\u{641}\u{62D}\u{635} \u{627}\u{62A}\u{635}\u{627}\u{644} \u{627}\u{644}\u{628}\u{644}\u{627}\u{64A}\u{633}\u{62A}\u{64A}\u{634}\u{646} \u{623}\u{648}\u{644}\u{627}\u{64B}"))
+                            Text(transferMode == .usb
+                                 ? t("Tap to select a PKG for USB transfer", "اضغط لاختيار ملف PKG للنقل عبر USB")
+                                 : connectionIsValid
+                                 ? t("Tap to select one or more packages", "اضغط لاختيار ملف أو عدة ملفات")
+                                 : t("Check the PlayStation connection first", "افحص اتصال البلايستيشن أولاً"))
                                 .font(.headline)
-                                .foregroundColor(connectionIsValid ? .primary : .secondary)
+                                .foregroundColor((transferMode == .usb || connectionIsValid) ? .primary : .secondary)
                                 .lineLimit(2)
                         }
 
                         Spacer()
 
-                        Image(systemName: connectionIsValid ? "chevron.forward" : "lock.fill")
+                        Image(systemName: (transferMode == .usb || connectionIsValid) ? "chevron.forward" : "lock.fill")
                             .font(.caption.bold())
                             .foregroundColor(.secondary)
                     }
@@ -894,7 +1034,7 @@ struct ContentView: View {
                     .background(cardBackground)
                 }
                 .buttonStyle(.plain)
-                .disabled(isSending || !connectionIsValid)
+                .disabled(isSending || (transferMode == .wifi && !connectionIsValid))
 
             } else {
 
@@ -1718,6 +1858,7 @@ struct ContentView: View {
 
     private func syncPrimarySelection() {
         guard let first = packageQueue.first else {
+            USBBridgeServer.shared.setSelectedFile(nil)
             selectedFile = nil
             selectedMetadata = nil
             metadataError = nil
@@ -1726,6 +1867,7 @@ struct ContentView: View {
         }
 
         selectedFile = first.url
+        USBBridgeServer.shared.setSelectedFile(first.url)
         selectedMetadata = first.metadata
         metadataError = first.metadataError
         isReadingMetadata = first.isReadingMetadata
@@ -2065,7 +2207,7 @@ struct ContentView: View {
         .controlSize(.large)
         .disabled(
             packageQueue.isEmpty ||
-            !connectionIsValid ||
+            (transferMode == .wifi && !connectionIsValid) ||
             packageQueue.contains(where: { $0.isReadingMetadata })
         )
     }
@@ -2081,7 +2223,7 @@ struct ContentView: View {
             role: .destructive
         ) {
 
-            cancelTransfer()
+            showCancelConfirmation = true
 
         } label: {
 
@@ -2421,7 +2563,37 @@ struct ContentView: View {
         sendCurrentPackage()
     }
 
+    private func sendCurrentPackageOverUSB() {
+        guard let file = selectedFile else {
+            status = t("Select a PKG file first.", "اختر ملف PKG أولاً.")
+            return
+        }
+
+        // Keep the bridge pointed at exactly the file shown in Home, then arm it.
+        // The PS4 payload can already be running: it waits on INFO until this flag is set.
+        USBBridgeServer.shared.setSelectedFile(file)
+        USBBridgeServer.shared.armSelectedFile()
+
+        prepareNewTransfer()
+        transferStartDate = Date()
+        speedSamplesTotal = 0
+        speedSamplesCount = 0
+        peakSpeed = 0
+        historySavedForTransfer = false
+        isSending = true
+        UIApplication.shared.isIdleTimerDisabled = true
+        status = t(
+            "USB transfer armed. Waiting for the PS4 payload…",
+            "تم تجهيز نقل USB. بانتظار بايلود البلايستيشن…"
+        )
+    }
+
     private func sendCurrentPackage() {
+
+        if transferMode == .usb {
+            sendCurrentPackageOverUSB()
+            return
+        }
 
         guard connectionIsValid
         else {
@@ -2472,6 +2644,7 @@ struct ContentView: View {
 
         speedSamplesTotal = 0
         speedSamplesCount = 0
+        peakSpeed = 0
 
         historySavedForTransfer =
             false
@@ -2490,8 +2663,9 @@ struct ContentView: View {
         do {
 
             let newServer =
-                try LocalHTTPServer(
+                try makePKGHTTPServer(
                     fileURL: file,
+                    targetPlayStationIP: cleanIP,
 
                     onReady: {
                         packageURL in
@@ -2562,6 +2736,11 @@ struct ContentView: View {
                             self
                                 .speedSamplesCount +=
                                 1
+
+                            self.peakSpeed = max(
+                                self.peakSpeed,
+                                transfer.bytesPerSecond
+                            )
                         }
 
                         if transfer
@@ -2680,6 +2859,8 @@ struct ContentView: View {
 
     private func cancelTransfer() {
 
+        if transferMode == .usb { USBBridgeServer.shared.disarm() }
+
         // Save history BEFORE
         // resetting transfer data.
 
@@ -2780,6 +2961,9 @@ struct ContentView: View {
 
                 averageSpeed:
                     averageSpeed,
+
+                peakSpeed:
+                    peakSpeed,
 
                 duration:
                     duration,
@@ -2891,6 +3075,13 @@ struct ContentView: View {
         request.httpMethod =
             "POST"
 
+        // Fail fast if the RPI connection disappeared after the last successful check.
+        // More importantly, never leave the UI showing a green Connected badge after
+        // /api/install itself has failed.
+        let isHotspotTarget = cleanIP.hasPrefix("172.20.10.")
+        request.timeoutInterval = isHotspotTarget ? 15 : 10
+        TransferDiagnostics.log("RPI POST config hotspot=\(isHotspotTarget) timeout=\(Int(request.timeoutInterval))s")
+
         request.setValue(
             "application/json",
             forHTTPHeaderField:
@@ -2932,6 +3123,8 @@ struct ContentView: View {
             return
         }
 
+        TransferDiagnostics.log("RPI POST begin endpoint=\(url.absoluteString) package=\(packageURL)")
+
         URLSession.shared
             .dataTask(
                 with: request
@@ -2954,6 +3147,11 @@ struct ContentView: View {
                         if let error =
                             error {
 
+                            TransferDiagnostics.log("RPI POST error=\(error.localizedDescription)")
+                            self.connectionState = .disconnected
+                            self.checkedIP = ""
+                            self.checkedPort = ""
+
                             self.isSending =
                                 false
 
@@ -2975,6 +3173,8 @@ struct ContentView: View {
                             as?
                             HTTPURLResponse {
 
+                            TransferDiagnostics.log("RPI POST response status=\(http.statusCode) bytes=\(data?.count ?? 0)")
+
                             if (200...299)
                                 .contains(
                                     http
@@ -2988,6 +3188,10 @@ struct ContentView: View {
                                     )
 
                             } else {
+
+                                self.connectionState = .disconnected
+                                self.checkedIP = ""
+                                self.checkedPort = ""
 
                                 self.isSending =
                                     false
@@ -3050,6 +3254,7 @@ struct ContentView: View {
 
         speedSamplesTotal = 0
         speedSamplesCount = 0
+        peakSpeed = 0
 
         historySavedForTransfer =
             false
@@ -3077,6 +3282,7 @@ struct ContentView: View {
 
         speedSamplesTotal = 0
         speedSamplesCount = 0
+        peakSpeed = 0
 
         historySavedForTransfer =
             false
@@ -3214,7 +3420,7 @@ struct ContentView: View {
 // ======================================================
 
 enum PKGMainTab: String, CaseIterable, Identifiable {
-    case home, history, library, settings
+    case home, history, library, tools, settings
     var id: String { rawValue }
 
     var icon: String {
@@ -3222,6 +3428,7 @@ enum PKGMainTab: String, CaseIterable, Identifiable {
         case .home: return "house.fill"
         case .history: return "clock.arrow.circlepath"
         case .library: return "books.vertical.fill"
+        case .tools: return "wrench.and.screwdriver.fill"
         case .settings: return "gearshape.fill"
         }
     }
@@ -3231,6 +3438,7 @@ enum PKGMainTab: String, CaseIterable, Identifiable {
         case .home: return isArabic ? "الرئيسية" : "Home"
         case .history: return isArabic ? "السجل" : "History"
         case .library: return isArabic ? "المكتبة" : "Library"
+        case .tools: return isArabic ? "الأدوات" : "Tools"
         case .settings: return isArabic ? "الإعدادات" : "Settings"
         }
     }
@@ -3492,6 +3700,9 @@ struct HistoryView: View {
             historyDetail(icon: "externaldrive.fill", title: isArabic ? "حجم الملف" : "File Size", value: formatBytes(item.totalBytes))
             historyDetail(icon: "arrow.up.arrow.down", title: isArabic ? "تم نقله" : "Transferred", value: "\(formatBytes(item.transferredBytes)) / \(formatBytes(item.totalBytes))")
             historyDetail(icon: "speedometer", title: isArabic ? "متوسط السرعة" : "Average Speed", value: formatSpeed(item.averageSpeed))
+            if let peak = item.peakSpeed, peak > 0 {
+                historyDetail(icon: "gauge.with.dots.needle.67percent", title: isArabic ? "أعلى سرعة" : "Peak Speed", value: formatSpeed(peak))
+            }
             historyDetail(icon: "timer", title: item.completed ? (isArabic ? "مدة النقل" : "Transfer Time") : (isArabic ? "المدة قبل الإلغاء" : "Time Before Cancellation"), value: formatDuration(item.duration))
             historyDetail(icon: "calendar", title: isArabic ? "التاريخ والوقت" : "Date & Time", value: fullDate(item.date))
         }.padding(12).background(RoundedRectangle(cornerRadius: 14).fill(Color(.tertiarySystemGroupedBackground)))
@@ -3536,460 +3747,149 @@ struct HistoryView: View {
 // ======================================================
 
 struct SettingsView: View {
+    @Binding var appLanguage: String
+    @Binding var psPort: String
+    @AppStorage("libraryAppearance") private var libraryAppearance = "modern"
 
-    @Binding var appLanguage:
-        String
-
-    @Binding var psPort:
-        String
-
-    @Environment(\.dismiss)
-    private var dismiss
-
-    @State
-    private var showPortWarning =
-        false
-
-    @State
-    private var editingPort =
-        false
-
-    @State
-    private var portDraft = ""
-
-    private var isArabic:
-        Bool {
-
-        appLanguage == "ar"
-    }
-
-    private var layoutDirection:
-        LayoutDirection {
-
-        isArabic
-        ? .rightToLeft
-        : .leftToRight
-    }
+    private var isArabic: Bool { appLanguage == "ar" }
+    private func t(_ en: String, _ ar: String) -> String { isArabic ? ar : en }
 
     var body: some View {
-
         NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    UnifiedPageHeader(title: t("Settings", "الإعدادات"), subtitle: t("Make PKG Sender yours", "خصص PKG Sender بطريقتك"))
 
-            Form {
-
-                Section {
-                    UnifiedPageHeader(
-                        title: isArabic ? "الإعدادات" : "Settings",
-                        subtitle: isArabic ? "التفضيلات" : "Preferences"
-                    )
-                    .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 6, trailing: 0))
-                    .listRowBackground(Color.clear)
-                }
-
-                // MARK: Language
-
-                Section {
-
-                    HStack {
-
-                        Label {
-
-                            Text(
-                                isArabic
-                                ? "\u{627}\u{644}\u{644}\u{63A}\u{629}"
-                                : "Language"
-                            )
-
-                        } icon: {
-
-                            Image(
-                                systemName:
-                                    "globe"
-                            )
+                    settingsGroup(t("GENERAL", "عام")) {
+                        NavigationLink { LibraryAppearanceSettings(isArabic: isArabic, selection: $libraryAppearance) } label: {
+                            settingsRow(icon: "books.vertical.fill", tint: .indigo, title: t("Library Appearance", "مظهر المكتبة"), value: libraryAppearance == "classic" ? t("Classic", "كلاسيكي") : t("Modern", "حديث"))
                         }
-
-                        Spacer()
-
-                        Menu {
-
-                            Button {
-
-                                changeLanguage(
-                                    to: "en"
-                                )
-
-                            } label: {
-
-                                HStack {
-
-                                    Text(
-                                        "English"
-                                    )
-
-                                    if appLanguage ==
-                                        "en" {
-
-                                        Image(
-                                            systemName:
-                                                "checkmark"
-                                        )
-                                    }
-                                }
-                            }
-
-                            Button {
-
-                                changeLanguage(
-                                    to: "ar"
-                                )
-
-                            } label: {
-
-                                HStack {
-
-                                    Text(
-                                        "\u{627}\u{644}\u{639}\u{631}\u{628}\u{64A}\u{629}"
-                                    )
-
-                                    if appLanguage ==
-                                        "ar" {
-
-                                        Image(
-                                            systemName:
-                                                "checkmark"
-                                        )
-                                    }
-                                }
-                            }
-
-                        } label: {
-
-                            HStack(
-                                spacing: 6
-                            ) {
-
-                                Text(
-                                    isArabic
-                                    ? "\u{627}\u{644}\u{639}\u{631}\u{628}\u{64A}\u{629}"
-                                    : "English"
-                                )
-
-                                Image(
-                                    systemName:
-                                        "chevron.up.chevron.down"
-                                )
-                                .font(
-                                    .caption
-                                )
-                            }
-                            .foregroundColor(
-                                .secondary
-                            )
+                        rowDivider
+                        NavigationLink { LanguageSettings(appLanguage: $appLanguage) } label: {
+                            settingsRow(icon: "globe", tint: .cyan, title: t("Language", "اللغة"), value: isArabic ? "العربية" : "English")
+                        }
+                        rowDivider
+                        NavigationLink { PlayStationSettings(psPort: $psPort, isArabic: isArabic) } label: {
+                            settingsRow(icon: "gamecontroller.fill", tint: .purple, title: t("PlayStation", "بلايستيشن"), value: "RPI")
                         }
                     }
 
-                } header: {
+                    settingsGroup(t("SUPPORT & ADVANCED", "الدعم والمتقدم")) {
+                        NavigationLink { DiagnosticsView(appLanguage: appLanguage) } label: {
+                            settingsRow(icon: "stethoscope", tint: .orange, title: t("Diagnostics & Errors", "التشخيص والأخطاء"))
+                        }
+                        rowDivider
+                        NavigationLink { AboutView(appLanguage: appLanguage) } label: {
+                            settingsRow(icon: "info.circle.fill", tint: .blue, title: t("About PKG Sender", "حول PKG Sender"))
+                        }
+                    }
 
-                    Text(
-                        isArabic
-                        ? "\u{639}\u{627}\u{645}"
-                        : "GENERAL"
-                    )
-                }
-
-                // MARK: PlayStation
-
-                Section {
-
-                    Button {
-
-                        portDraft =
-                            psPort
-
-                        showPortWarning =
-                            true
-
-                    } label: {
-
-                        HStack {
-
-                            Label {
-
-                                Text(
-                                    isArabic
-                                    ? "\u{627}\u{644}\u{645}\u{646}\u{641}\u{630}"
-                                    : "Port"
-                                )
-                                .foregroundColor(
-                                    .primary
-                                )
-
-                            } icon: {
-
-                                Image(
-                                    systemName:
-                                        "network"
-                                )
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text(t("LIBRARY PREVIEW", "معاينة المكتبة")).font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.horizontal, 4)
+                        HStack(spacing: 12) {
+                            Image(systemName: libraryAppearance == "modern" ? "rectangle.grid.2x2.fill" : "rectangle.grid.3x2.fill").font(.system(size: 25, weight: .semibold)).foregroundStyle(.blue).frame(width: 48, height: 48).background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(libraryAppearance == "modern" ? t("Modern Library", "المكتبة الحديثة") : t("Classic Library", "المكتبة الكلاسيكية")).font(.headline)
+                                Text(t("Both layouts open the same Game Hub.", "كلا التصميمين يفتحان نفس مركز اللعبة.")).font(.caption).foregroundStyle(.secondary)
                             }
-
                             Spacer()
-
-                            Text(psPort)
-                                .foregroundColor(
-                                    .secondary
-                                )
-                                .environment(
-                                    \.layoutDirection,
-                                    .leftToRight
-                                )
-
-                            Image(
-                                systemName:
-                                    "chevron.forward"
-                            )
-                            .font(.caption)
-                            .foregroundColor(
-                                .secondary
-                            )
-                        }
+                        }.padding(15).background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
                     }
-
-                    if editingPort {
-
-                        HStack {
-
-                            TextField(
-                                "12800",
-                                text:
-                                    $portDraft
-                            )
-                            .keyboardType(
-                                .numberPad
-                            )
-                            .environment(
-                                \.layoutDirection,
-                                .leftToRight
-                            )
-
-                            Button(
-                                isArabic
-                                ? "\u{62D}\u{641}\u{638}"
-                                : "Save"
-                            ) {
-
-                                savePort()
-                            }
-                            .disabled(
-                                !validPort
-                            )
-                        }
-                    }
-
-                    if psPort !=
-                        "12800" {
-
-                        Button {
-
-                            psPort =
-                                "12800"
-
-                            portDraft =
-                                "12800"
-
-                            editingPort =
-                                false
-
-                        } label: {
-
-                            Label(
-                                isArabic
-                                ? "\u{625}\u{639}\u{627}\u{62F}\u{629} \u{644}\u{644}\u{627}\u{641}\u{62A}\u{631}\u{627}\u{636}\u{64A}"
-                                : "Reset to Default",
-                                systemImage:
-                                    "arrow.counterclockwise"
-                            )
-                        }
-                    }
-
-                } header: {
-
-                    Text(
-                        isArabic
-                        ? "\u{628}\u{644}\u{627}\u{64A}\u{633}\u{62A}\u{64A}\u{634}\u{646}"
-                        : "PLAYSTATION"
-                    )
-
-                } footer: {
-
-                    Text(
-                        isArabic
-                        ? "\u{627}\u{644}\u{645}\u{646}\u{641}\u{630} \u{627}\u{644}\u{627}\u{641}\u{62A}\u{631}\u{627}\u{636}\u{64A} \u{644}\u{640} Remote Package Installer \u{647}\u{648} 12800."
-                        : "The default Remote Package Installer port is 12800."
-                    )
+                    Spacer(minLength: 110)
                 }
-
-                // MARK: Diagnostics
-
-                Section {
-                    NavigationLink {
-                        DiagnosticsView(appLanguage: appLanguage)
-                    } label: {
-                        Label(
-                            isArabic ? "\u{627}\u{644}\u{62A}\u{634}\u{62E}\u{64A}\u{635} \u{648}\u{627}\u{644}\u{623}\u{62E}\u{637}\u{627}\u{621}" : "Diagnostics & Errors",
-                            systemImage: "stethoscope"
-                        )
-                    }
-                } header: {
-                    Text(isArabic ? "\u{627}\u{644}\u{62A}\u{634}\u{62E}\u{64A}\u{635}" : "DIAGNOSTICS")
-                } footer: {
-                    Text(
-                        isArabic
-                        ? "\u{64A}\u{639}\u{631}\u{636} \u{633}\u{62C}\u{644} \u{627}\u{644}\u{646}\u{642}\u{644} \u{648}\u{627}\u{644}\u{623}\u{62E}\u{637}\u{627}\u{621} \u{648}\u{64A}\u{645}\u{643}\u{646}\u{643} \u{646}\u{633}\u{62E}\u{647} \u{623}\u{648} \u{645}\u{634}\u{627}\u{631}\u{643}\u{62A}\u{647}."
-                        : "Shows the transfer/error log so you can copy or share it."
-                    )
-                }
-
-                // MARK: About
-
-                Section {
-                    NavigationLink {
-                        AboutView(appLanguage: appLanguage)
-                    } label: {
-                        Label(
-                            isArabic ? "\u{62D}\u{648}\u{644} PKG Sender" : "About PKG Sender",
-                            systemImage: "info.circle"
-                        )
-                    }
-                } header: {
-                    Text(isArabic ? "\u{62D}\u{648}\u{644} \u{627}\u{644}\u{62A}\u{637}\u{628}\u{64A}\u{642}" : "ABOUT")
-                }
-
-                Section {
-                    Color.clear
-                        .frame(height: 96)
-                        .listRowBackground(Color.clear)
-                        .listRowSeparator(.hidden)
-                }
+                .padding(.horizontal, 18).padding(.top, 8)
             }
-            .id(appLanguage)
+            .background(Color(.systemBackground))
             .navigationBarHidden(true)
+        }
+        .environment(\.layoutDirection, isArabic ? .rightToLeft : .leftToRight)
+        .id("settings-\(appLanguage)")
+    }
 
+    private func settingsGroup<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.horizontal, 4)
+            VStack(spacing: 0) { content() }
+                .padding(.horizontal, 13)
+                .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Color.primary.opacity(0.055), lineWidth: 0.7))
+        }
+    }
 
-            .alert(
-                isArabic
-                ? "\u{62A}\u{63A}\u{64A}\u{64A}\u{631} \u{645}\u{646}\u{641}\u{630} Remote Package Installer\u{61F}"
-                : "Change Remote Package Installer Port?",
-                isPresented:
-                    $showPortWarning
-            ) {
+    private func settingsRow(icon: String, tint: Color, title: String, value: String? = nil) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon).font(.system(size: 16, weight: .semibold)).foregroundStyle(.white).frame(width: 34, height: 34).background(tint, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            Text(title).font(.system(size: 16, weight: .medium)).foregroundStyle(.primary)
+            Spacer()
+            if let value { Text(value).font(.subheadline).foregroundStyle(.secondary) }
+            Image(systemName: "chevron.forward").font(.caption.weight(.bold)).foregroundStyle(.tertiary)
+        }.frame(minHeight: 58).contentShape(Rectangle())
+    }
 
-                Button(
-                    isArabic
-                    ? "\u{625}\u{644}\u{63A}\u{627}\u{621}"
-                    : "Cancel",
-                    role: .cancel
-                ) { }
+    private var rowDivider: some View { Divider().opacity(0.14).padding(.leading, 46) }
+}
 
-                Button(
-                    isArabic
-                    ? "\u{62A}\u{63A}\u{64A}\u{64A}\u{631}"
-                    : "Change"
-                ) {
+private struct LibraryAppearanceSettings: View {
+    let isArabic: Bool
+    @Binding var selection: String
+    private func t(_ en: String, _ ar: String) -> String { isArabic ? ar : en }
+    var body: some View {
+        List {
+            Section {
+                choice("modern", icon: "rectangle.grid.2x2.fill", title: t("Modern", "حديث"), subtitle: t("Large artwork, cleaner collection view", "أغلفة أكبر وعرض أنظف للمجموعة"))
+                choice("classic", icon: "rectangle.grid.3x2.fill", title: t("Classic", "كلاسيكي"), subtitle: t("Original PKG Sender library layout", "تصميم مكتبة PKG Sender الأصلي"))
+            } footer: { Text(t("This only changes how games are displayed. Both styles use the same library data and Game Hub.", "هذا يغير طريقة عرض الألعاب فقط. كلا التصميمين يستخدمان نفس بيانات المكتبة ونفس مركز اللعبة.")) }
+        }
+        .navigationTitle(t("Library Appearance", "مظهر المكتبة"))
+        .navigationBarTitleDisplayMode(.inline)
+    }
+    private func choice(_ id: String, icon: String, title: String, subtitle: String) -> some View {
+        Button { withAnimation(.easeInOut(duration: 0.2)) { selection = id } } label: {
+            HStack(spacing: 12) {
+                Image(systemName: icon).font(.title3).frame(width: 32).foregroundStyle(selection == id ? Color.accentColor : Color.secondary)
+                VStack(alignment: .leading, spacing: 3) { Text(title).font(.headline).foregroundStyle(.primary); Text(subtitle).font(.caption).foregroundStyle(.secondary) }
+                Spacer(); if selection == id { Image(systemName: "checkmark.circle.fill").foregroundStyle(.blue) }
+            }.padding(.vertical, 5)
+        }.buttonStyle(.plain)
+    }
+}
 
-                    portDraft =
-                        psPort
+private struct LanguageSettings: View {
+    @Binding var appLanguage: String
+    private var isArabic: Bool { appLanguage == "ar" }
+    var body: some View {
+        List {
+            Button { appLanguage = "en" } label: { HStack { Text("English").foregroundStyle(.primary); Spacer(); if appLanguage == "en" { Image(systemName: "checkmark").foregroundStyle(.blue) } } }
+            Button { appLanguage = "ar" } label: { HStack { Text("العربية").foregroundStyle(.primary); Spacer(); if appLanguage == "ar" { Image(systemName: "checkmark").foregroundStyle(.blue) } } }
+        }.navigationTitle(isArabic ? "اللغة" : "Language").navigationBarTitleDisplayMode(.inline)
+    }
+}
 
-                    editingPort =
-                        true
-                }
-
-            } message: {
-
-                Text(
-                    isArabic
-                    ? "\u{627}\u{644}\u{645}\u{646}\u{641}\u{630} 12800 \u{647}\u{648} \u{627}\u{644}\u{645}\u{646}\u{641}\u{630} \u{627}\u{644}\u{627}\u{641}\u{62A}\u{631}\u{627}\u{636}\u{64A} \u{644}\u{640} Remote Package Installer. \u{644}\u{627} \u{62A}\u{63A}\u{64A}\u{651}\u{631}\u{647} \u{625}\u{644}\u{627} \u{625}\u{630}\u{627} \u{643}\u{627}\u{646}\u{62A} \u{627}\u{644}\u{62E}\u{62F}\u{645}\u{629} \u{639}\u{644}\u{649} \u{627}\u{644}\u{628}\u{644}\u{627}\u{64A}\u{633}\u{62A}\u{64A}\u{634}\u{646} \u{62A}\u{633}\u{62A}\u{62E}\u{62F}\u{645} \u{645}\u{646}\u{641}\u{630}\u{64B}\u{627} \u{645}\u{62E}\u{62A}\u{644}\u{641}\u{64B}\u{627}."
-                    : "Port 12800 is the default port for Remote Package Installer. Only change it if the service on your PlayStation uses a different port."
-                )
+private struct PlayStationSettings: View {
+    @Binding var psPort: String
+    let isArabic: Bool
+    @State private var draft = ""
+    @State private var showWarning = false
+    private func t(_ en: String, _ ar: String) -> String { isArabic ? ar : en }
+    private var valid: Bool { Int(draft).map { (1...65535).contains($0) } ?? false }
+    var body: some View {
+        Form {
+            Section {
+                HStack { Label(t("Port", "المنفذ"), systemImage: "network"); Spacer(); Text(psPort).foregroundStyle(.secondary) }
+                Button(t("Change Port", "تغيير المنفذ")) { draft = psPort; showWarning = true }
+                if psPort != "12800" { Button(t("Reset to 12800", "إعادة إلى 12800")) { psPort = "12800" } }
+            } header: {
+                Text(t("REMOTE PACKAGE INSTALLER", "REMOTE PACKAGE INSTALLER"))
+            } footer: {
+                Text(t("12800 is the default RPI port. Change it only if your PlayStation service uses another port.", "12800 هو المنفذ الافتراضي لـ RPI. غيّره فقط إذا كانت الخدمة على البلايستيشن تستخدم منفذًا آخر."))
             }
         }
-        .environment(
-            \.layoutDirection,
-            layoutDirection
-        )
-        .id(
-            "settings-\(appLanguage)"
-        )
-    }
-
-    // MARK: Port
-
-    private var validPort:
-        Bool {
-
-        let clean =
-            portDraft
-                .trimmingCharacters(
-                    in:
-                        .whitespacesAndNewlines
-                )
-
-        guard
-            let number =
-                Int(clean)
-        else {
-            return false
-        }
-
-        return (1...65535)
-            .contains(number)
-    }
-
-    private func savePort() {
-
-        let clean =
-            portDraft
-                .trimmingCharacters(
-                    in:
-                        .whitespacesAndNewlines
-                )
-
-        guard
-            let number =
-                Int(clean),
-
-            (1...65535)
-                .contains(number)
-
-        else {
-            return
-        }
-
-        psPort =
-            String(number)
-
-        portDraft =
-            psPort
-
-        editingPort =
-            false
-    }
-
-    // MARK: Language
-
-    private func changeLanguage(
-        to language:
-            String
-    ) {
-
-        guard
-            appLanguage !=
-                language
-        else {
-            return
-        }
-
-        appLanguage =
-            language
+        .navigationTitle(t("PlayStation", "بلايستيشن")).navigationBarTitleDisplayMode(.inline)
+        .alert(t("Change RPI Port", "تغيير منفذ RPI"), isPresented: $showWarning) {
+            TextField("12800", text: $draft).keyboardType(.numberPad)
+            Button(t("Cancel", "إلغاء"), role: .cancel) {}
+            Button(t("Save", "حفظ")) { if valid { psPort = String(Int(draft)!) } }.disabled(!valid)
+        } message: { Text(t("Only change this when you know RPI is listening on a different port.", "غيّر هذا فقط إذا كنت متأكدًا أن RPI يعمل على منفذ مختلف.")) }
     }
 }
 
@@ -4286,6 +4186,33 @@ struct DiagnosticsView: View {
     }
 
     private func loadLog() {
-        logText = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
+        // Never load the whole diagnostic file into a SwiftUI Text view.
+        // Long transfers can make this file many MB and freeze this screen.
+        let url = logURL
+        DispatchQueue.global(qos: .userInitiated).async {
+            var text = ""
+            do {
+                let handle = try FileHandle(forReadingFrom: url)
+                defer { try? handle.close() }
+
+                let size = try handle.seekToEnd()
+                let maxBytes: UInt64 = 128 * 1024
+                let start = size > maxBytes ? size - maxBytes : 0
+                try handle.seek(toOffset: start)
+                let data = try handle.readToEnd() ?? Data()
+                text = String(decoding: data, as: UTF8.self)
+
+                // If we started in the middle of a UTF-8/log line, drop that first fragment.
+                if start > 0, let newline = text.firstIndex(of: "\n") {
+                    text = String(text[text.index(after: newline)...])
+                }
+            } catch {
+                text = "Diagnostics read error: \(error.localizedDescription)"
+            }
+
+            DispatchQueue.main.async {
+                self.logText = text
+            }
+        }
     }
 }
