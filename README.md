@@ -14,15 +14,15 @@ PKG Sender is a native iOS app for managing and sending PS4 PKG files. It suppor
 
 | Home — Network | Home — USB |
 | --- | --- |
-| <img src="assets/screenshots/home-network.jpg" width="320"> | <img src="assets/screenshots/home-usb.jpg" width="320"> |
+| <img src="assets/home-network.jpg" width="320"> | <img src="assets/home-usb.jpg" width="320"> |
 
 | Library | Game Hub |
 | --- | --- |
-| <img src="assets/screenshots/library.jpg" width="320"> | <img src="assets/screenshots/game-hub.jpg" width="320"> |
+| <img src="assets/library.jpg" width="320"> | <img src="assets/game-hub.jpg" width="320"> |
 
 | Transfer History |
 | --- |
-| <img src="assets/screenshots/history-usb.jpg" width="320"> |
+| <img src="assets/history-usb.jpg" width="320"> |
 
 ## Features
 
