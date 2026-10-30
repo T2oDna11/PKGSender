@@ -8,7 +8,11 @@ targets:
     type: application
     platform: iOS
     sources:
-      - PKGSender
+      - path: PKGSender
+      - path: pkgusb.elf
+        buildPhase: resources
+      - path: payload.json
+        buildPhase: resources
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: com.mrw.PKGSender
       INFOPLIST_FILE: PKGSender/Info.plist
