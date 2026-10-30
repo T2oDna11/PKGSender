@@ -27,6 +27,7 @@ final class LocalHTTPServer {
     private let fileURL: URL
     private let onReady: (String) -> Void
     private let onProgress: (TransferProgress) -> Void
+    private let targetPlayStationIP: String?
 
     /*
      All server state, active stream bookkeeping and transfer statistics
@@ -52,6 +53,8 @@ final class LocalHTTPServer {
      can safely be released.
      */
     private var activeStreams: Int = 0
+    private var nextDiagnosticStreamID: Int = 1
+    private var lastDiagnosticSampleTime = Date.distantPast
     private var stopRequested = false
     private var resourcesReleased = false
 
@@ -86,11 +89,13 @@ final class LocalHTTPServer {
 
     init(
         fileURL: URL,
+        targetPlayStationIP: String? = nil,
         onReady: @escaping (String) -> Void,
         onProgress: @escaping (TransferProgress) -> Void = { _ in }
     ) throws {
 
         self.fileURL = fileURL
+        self.targetPlayStationIP = targetPlayStationIP
         self.onReady = onReady
         self.onProgress = onProgress
 
@@ -132,9 +137,12 @@ final class LocalHTTPServer {
             UInt64(st.st_size)
 
         do {
+            let isHotspotTarget = targetPlayStationIP?.hasPrefix("172.20.10.") == true
+            let requestedPort: NWEndpoint.Port = isHotspotTarget ? NWEndpoint.Port(rawValue: 8080)! : .any
+            TransferDiagnostics.log("SERVER CONFIG hotspot=\(isHotspotTarget) requestedPort=\(isHotspotTarget ? "8080" : "any") target=\(targetPlayStationIP ?? "nil")")
             self.listener = try NWListener(
                 using: .tcp,
-                on: .any
+                on: requestedPort
             )
         } catch {
             close(self.masterFileDescriptor)
@@ -158,6 +166,8 @@ final class LocalHTTPServer {
         }
 
         stopRequested = false
+        TransferDiagnostics.begin(engine: "STABLE-NW", fileSize: cachedFileSize,
+                                  details: "chunk=1MiB Network.framework")
 
         listener.stateUpdateHandler = { [weak self] state in
 
@@ -167,12 +177,13 @@ final class LocalHTTPServer {
 
             case .ready:
 
+                TransferDiagnostics.log("SERVER STATE ready")
                 guard let port = listener.port else {
                     print("LocalHTTPServer: port unavailable")
                     return
                 }
 
-                guard let ip = self.localIPv4() else {
+                guard let ip = self.localIPv4(for: self.targetPlayStationIP) else {
                     print("LocalHTTPServer: Wi-Fi IP unavailable")
                     return
                 }
@@ -184,12 +195,16 @@ final class LocalHTTPServer {
                     charactersIn: "/"
                 )
 
-                let filename =
-                    self.fileURL.lastPathComponent
-                        .addingPercentEncoding(
-                            withAllowedCharacters: allowed
-                        )
-                    ?? "game.pkg"
+                let isHotspotTarget = self.targetPlayStationIP?.hasPrefix("172.20.10.") == true
+                let filename: String
+                if isHotspotTarget {
+                    // Keep the URL deliberately simple for RPI prerequisite probing.
+                    filename = "pkg_0.pkg"
+                } else {
+                    filename = self.fileURL.lastPathComponent
+                        .addingPercentEncoding(withAllowedCharacters: allowed)
+                        ?? "game.pkg"
+                }
 
                 let url =
                     "http://\(ip):\(port.rawValue)/\(filename)"
@@ -197,6 +212,7 @@ final class LocalHTTPServer {
                 print(
                     "LocalHTTPServer ready: \(url)"
                 )
+                TransferDiagnostics.log("SERVER READY ip=\(ip) port=\(port.rawValue) url=\(url)")
 
                 DispatchQueue.main.async {
                     self.onReady(url)
@@ -204,6 +220,7 @@ final class LocalHTTPServer {
 
             case .failed(let error):
 
+                TransferDiagnostics.log("SERVER STATE failed error=\(error)")
                 print(
                     "LocalHTTPServer FAILED: \(error)"
                 )
@@ -212,12 +229,14 @@ final class LocalHTTPServer {
 
             case .waiting(let error):
 
+                TransferDiagnostics.log("SERVER STATE waiting error=\(error)")
                 print(
                     "LocalHTTPServer WAITING: \(error)"
                 )
 
             case .cancelled:
 
+                TransferDiagnostics.log("SERVER STATE cancelled")
                 print(
                     "LocalHTTPServer cancelled"
                 )
@@ -516,12 +535,14 @@ final class LocalHTTPServer {
         }
 
         var rangeHeader: String?
+        var userAgent: String?
+        var acceptEncoding: String?
 
         for line in lines {
 
-            if line
-                .lowercased()
-                .hasPrefix("range:") {
+            let lowercasedLine = line.lowercased()
+
+            if lowercasedLine.hasPrefix("range:") {
 
                 rangeHeader =
                     String(
@@ -532,8 +553,34 @@ final class LocalHTTPServer {
                     .trimmingCharacters(
                         in: .whitespaces
                     )
+            } else if lowercasedLine.hasPrefix("user-agent:") {
+
+                userAgent =
+                    String(
+                        line.dropFirst(
+                            "user-agent:".count
+                        )
+                    )
+                    .trimmingCharacters(
+                        in: .whitespaces
+                    )
+            } else if lowercasedLine.hasPrefix("accept-encoding:") {
+
+                acceptEncoding =
+                    String(
+                        line.dropFirst(
+                            "accept-encoding:".count
+                        )
+                    )
+                    .trimmingCharacters(
+                        in: .whitespaces
+                    )
             }
         }
+
+        TransferDiagnostics.log(
+            "HTTP REQUEST method=\(method) path=\(String(parts[1])) range=\(rangeHeader ?? "none") ua=\(userAgent ?? "none") encoding=\(acceptEncoding ?? "none")"
+        )
 
         sendFile(
             connection,
@@ -668,6 +715,10 @@ final class LocalHTTPServer {
 
         header += "\r\n"
 
+        TransferDiagnostics.log(
+            "HTTP RESPONSE status=\(partial ? 206 : 200) range=\(start)-\(end) fileSize=\(fileSize) contentLength=\(contentLength)"
+        )
+
         guard
             let headerData =
                 header.data(
@@ -779,16 +830,20 @@ final class LocalHTTPServer {
         }
 
         activeStreams += 1
+        let diagnosticStreamID = nextDiagnosticStreamID
+        nextDiagnosticStreamID += 1
 
         print(
             "LocalHTTPServer: stream opened FD=\(fd), range=\(start)-\(end), active=\(activeStreams)"
         )
+        TransferDiagnostics.log("STABLE stream#\(diagnosticStreamID) OPEN fd=\(fd) range=\(start)-\(end) length=\(end-start+1) active=\(activeStreams)")
 
         let stream =
             StreamContext(
                 fd: fd,
                 start: start,
-                end: end
+                end: end,
+                diagnosticID: diagnosticStreamID
             )
 
         sendNextChunk(
@@ -942,6 +997,10 @@ final class LocalHTTPServer {
                             "LocalHTTPServer: send error FD=\(stream.fd): \(error)"
                         )
 
+                        TransferDiagnostics.log(
+                            "STABLE stream#\(stream.diagnosticID) SEND ERROR position=\(position) bytesRead=\(bytesRead) error=\(error)"
+                        )
+
                         self.finishStream(
                             connection,
                             stream: stream,
@@ -1010,6 +1069,7 @@ final class LocalHTTPServer {
         print(
             "LocalHTTPServer: stream closed FD=\(fd), reason=\(reason), active=\(activeStreams)"
         )
+        TransferDiagnostics.log("STABLE stream#\(stream.diagnosticID) CLOSE fd=\(fd) reason=\(reason) active=\(activeStreams)")
 
         connection.cancel()
 
@@ -1127,6 +1187,11 @@ final class LocalHTTPServer {
                 bytesPerSecond: smoothedSpeed
             )
 
+        if now.timeIntervalSince(lastDiagnosticSampleTime) >= 2.0 {
+            lastDiagnosticSampleTime = now
+            TransferDiagnostics.log(String(format: "STABLE SAMPLE visible=%llu totalActualBytes=%llu speed=%.2fMiB/s active=%d", visiblePosition, totalBytesSentForSpeed, smoothedSpeed / 1_048_576.0, activeStreams))
+        }
+
         DispatchQueue.main.async {
             self.onProgress(progress)
         }
@@ -1229,101 +1294,98 @@ final class LocalHTTPServer {
 
     // MARK: - Local IP
 
-    private func localIPv4() -> String? {
+    private func localIPv4(for targetIP: String?) -> String? {
+        let interfaces = ipv4Interfaces()
+        let interfaceSummary = interfaces.map { "\($0.name)=\($0.address)" }.joined(separator: ", ")
+        TransferDiagnostics.log("NET interfaces [\(interfaceSummary)] target=\(targetIP ?? "nil")")
 
-        var addresses:
-            UnsafeMutablePointer<ifaddrs>?
-
-        guard
-            getifaddrs(
-                &addresses
-            ) == 0,
-            let first =
-                addresses
-        else {
-
-            return nil
-        }
-
-        defer {
-            freeifaddrs(
-                addresses
-            )
-        }
-
-        var pointer:
-            UnsafeMutablePointer<ifaddrs>? =
-            first
-
-        while let interface =
-            pointer {
-
-            defer {
-                pointer =
-                    interface.pointee.ifa_next
-            }
-
-            guard let address =
-                interface.pointee.ifa_addr
-            else {
-
-                continue
-            }
-
-            let family =
-                address.pointee.sa_family
-
-            guard family ==
-                UInt8(AF_INET)
-            else {
-
-                continue
-            }
-
-            let name =
-                String(
-                    cString:
-                        interface.pointee.ifa_name
-                )
-
-            guard name == "en0" else {
-                continue
-            }
-
-            var hostname =
-                [CChar](
-                    repeating: 0,
-                    count:
-                        Int(
-                            NI_MAXHOST
-                        )
-                )
-
-            let result =
-                getnameinfo(
-                    address,
-                    socklen_t(
-                        address.pointee.sa_len
-                    ),
-                    &hostname,
-                    socklen_t(
-                        hostname.count
-                    ),
-                    nil,
-                    0,
-                    NI_NUMERICHOST
-                )
-
-            if result == 0 {
-
-                return String(
-                    cString:
-                        hostname
-                )
+        // First choice: an address that is actually on the same IPv4 subnet as the PS4.
+        // This preserves normal router/LAN behaviour and avoids choosing an unrelated en0.
+        if let targetIP,
+           let target = ipv4Number(targetIP) {
+            for item in interfaces where item.netmask != 0 {
+                if (item.addressNumber & item.netmask) == (target & item.netmask) {
+                    TransferDiagnostics.log("NET selected same-subnet \(item.name)=\(item.address)")
+                    return item.address
+                }
             }
         }
 
+        // Personal Hotspot can NAT its client-facing address and hide that address from
+        // getifaddrs(). In that case iOS may report an internal source (for example
+        // 192.168.x.x) even though the PS4 sees the hotspot gateway on its own subnet.
+        // Derive the Apple-hotspot gateway from the PS4 address instead of hardcoding .1.
+        if let targetIP,
+           let target = ipv4Number(targetIP),
+           (target & 0xFFFFFFF0) == 0xAC140A00 { // 172.20.10.0/28 Apple hotspot range
+            let gateway = (target & 0xFFFFFFF0) | 1
+            let derived = ipv4String(gateway)
+            TransferDiagnostics.log("NET selected hotspot-derived gateway=\(derived) from target=\(targetIP)")
+            return derived
+        }
+
+        // Normal fallback: keep the original Wi-Fi preference.
+        if let wifi = interfaces.first(where: { $0.name == "en0" }) {
+            TransferDiagnostics.log("NET selected fallback en0=\(wifi.address)")
+            return wifi.address
+        }
+        if let bridge = interfaces.first(where: { $0.name.hasPrefix("bridge") || $0.name.hasPrefix("ap") }) {
+            TransferDiagnostics.log("NET selected fallback \(bridge.name)=\(bridge.address)")
+            return bridge.address
+        }
+
+        TransferDiagnostics.log("NET no usable IPv4 address")
         return nil
+    }
+
+    private struct IPv4InterfaceInfo {
+        let name: String
+        let address: String
+        let addressNumber: UInt32
+        let netmask: UInt32
+    }
+
+    private func ipv4Interfaces() -> [IPv4InterfaceInfo] {
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let first = addresses else { return [] }
+        defer { freeifaddrs(addresses) }
+
+        var result: [IPv4InterfaceInfo] = []
+        var pointer: UnsafeMutablePointer<ifaddrs>? = first
+        while let interface = pointer {
+            defer { pointer = interface.pointee.ifa_next }
+            guard let address = interface.pointee.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_INET) else { continue }
+
+            let name = String(cString: interface.pointee.ifa_name)
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(address, socklen_t(address.pointee.sa_len), &hostname,
+                              socklen_t(hostname.count), nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let ip = String(cString: hostname)
+            guard ip != "127.0.0.1", !ip.hasPrefix("169.254."), let number = ipv4Number(ip) else { continue }
+
+            var maskNumber: UInt32 = 0
+            if let mask = interface.pointee.ifa_netmask,
+               mask.pointee.sa_family == UInt8(AF_INET) {
+                let sin = UnsafeRawPointer(mask).assumingMemoryBound(to: sockaddr_in.self)
+                maskNumber = UInt32(bigEndian: sin.pointee.sin_addr.s_addr)
+            }
+            result.append(.init(name: name, address: ip, addressNumber: number, netmask: maskNumber))
+        }
+        return result
+    }
+
+    private func ipv4Number(_ string: String) -> UInt32? {
+        var addr = in_addr()
+        guard string.withCString({ inet_pton(AF_INET, $0, &addr) }) == 1 else { return nil }
+        return UInt32(bigEndian: addr.s_addr)
+    }
+
+    private func ipv4String(_ number: UInt32) -> String {
+        var addr = in_addr(s_addr: number.bigEndian)
+        var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        guard inet_ntop(AF_INET, &addr, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else { return "0.0.0.0" }
+        return String(cString: buffer)
     }
 
     // MARK: - Stream Context
@@ -1340,13 +1402,15 @@ final class LocalHTTPServer {
 
         let start: UInt64
         let end: UInt64
+        let diagnosticID: Int
 
         var finished = false
 
         init(
             fd: Int32,
             start: UInt64,
-            end: UInt64
+            end: UInt64,
+            diagnosticID: Int
         ) {
 
             self.fd =
@@ -1357,6 +1421,9 @@ final class LocalHTTPServer {
 
             self.end =
                 end
+
+            self.diagnosticID =
+                diagnosticID
         }
 
         deinit {

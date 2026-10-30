@@ -2,51 +2,27 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+/// One reliable Files picker used across PKG Sender.
+/// `asCopy` avoids depending on a provider URL after the picker closes.
 struct PKGDocumentPicker: UIViewControllerRepresentable {
+    var contentTypes: [UTType] = [.item]
+    var allowsMultipleSelection: Bool = true
     var onPick: ([URL]) -> Void
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onPick: onPick)
-    }
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let picker = UIDocumentPickerViewController(
-            forOpeningContentTypes: [UTType.item],
-            asCopy: true
-        )
-
-        picker.allowsMultipleSelection = true
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: true)
+        picker.allowsMultipleSelection = allowsMultipleSelection
         picker.delegate = context.coordinator
-
         return picker
     }
 
-    func updateUIViewController(
-        _ uiViewController: UIDocumentPickerViewController,
-        context: Context
-    ) {
-    }
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
 
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
         private let onPick: ([URL]) -> Void
-
-        init(onPick: @escaping ([URL]) -> Void) {
-            self.onPick = onPick
-        }
-
-        func documentPicker(
-            _ controller: UIDocumentPickerViewController,
-            didPickDocumentsAt urls: [URL]
-        ) {
-            // Secure/move imported URLs while the picker still owns them.
-            // ContentView closes the SwiftUI sheet after onPick returns.
-            self.onPick(urls)
-        }
-
-        func documentPickerWasCancelled(
-            _ controller: UIDocumentPickerViewController
-        ) {
-            controller.dismiss(animated: true)
-        }
+        init(onPick: @escaping ([URL]) -> Void) { self.onPick = onPick }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { onPick(urls) }
     }
 }

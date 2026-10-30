@@ -112,10 +112,10 @@ final class LibraryStore: ObservableObject {
 
         let root = libraryFolderURL
         let existing = packages
-
         DispatchQueue.global(qos: .userInitiated).async {
+            let fileManager = FileManager.default
             let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey]
-            let enumerator = self.fm.enumerator(at: root, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles], errorHandler: { _, _ in true })
+            let enumerator = fileManager.enumerator(at: root, includingPropertiesForKeys: Array(keys), options: [.skipsHiddenFiles], errorHandler: { _, _ in true })
             var urls: [URL] = []
             while let url = enumerator?.nextObject() as? URL {
                 if url.pathExtension.lowercased() == "pkg" { urls.append(url) }

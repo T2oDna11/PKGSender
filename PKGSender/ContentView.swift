@@ -6,6 +6,11 @@ import Network
 // MARK: - Transfer History Model
 // ======================================================
 
+enum TransferMode: String {
+    case wifi
+    case usb
+}
+
 struct TransferHistoryItem: Identifiable, Codable {
 
     let id: UUID
@@ -25,6 +30,7 @@ struct TransferHistoryItem: Identifiable, Codable {
     let version: String?
     let packageKind: String?
     let iconData: Data?
+    let transferType: String?
 
     init(
         id: UUID = UUID(),
@@ -42,7 +48,8 @@ struct TransferHistoryItem: Identifiable, Codable {
         contentID: String? = nil,
         version: String? = nil,
         packageKind: String? = nil,
-        iconData: Data? = nil
+        iconData: Data? = nil,
+        transferType: String? = nil
     ) {
         self.id = id
         self.fileName = fileName
@@ -60,6 +67,7 @@ struct TransferHistoryItem: Identifiable, Codable {
         self.version = version
         self.packageKind = packageKind
         self.iconData = iconData
+        self.transferType = transferType
     }
 }
 
@@ -205,11 +213,6 @@ struct ContentView: View {
     @State private var checkedIP = ""
     @State private var checkedPort = ""
 
-    private enum TransferMode: String {
-        case wifi
-        case usb
-    }
-
     @State private var transferMode: TransferMode = .wifi
 
     // MARK: File / Server
@@ -280,6 +283,7 @@ struct ContentView: View {
                         psIP: psIP,
                         detailsPackages: $libraryDetailsPackages,
                         historyItems: historyStore.items,
+                        transferMode: $transferMode,
                         onSendPackage: { package in sendLibraryPackage(package) },
                         onQueuePackage: { package in queueLibraryPackage(package) },
                         onGoHome: {
@@ -336,6 +340,7 @@ struct ContentView: View {
                         subtitle: "PKG Sender"
                     )
                     transferModeCard
+                    if transferMode == .usb { usbPayloadStatusCard }
                     if transferMode == .wifi {
                         connectionCard
                     }
@@ -356,7 +361,7 @@ struct ContentView: View {
                 }
                 .padding()
             }
-            .background(Color(.systemGroupedBackground).ignoresSafeArea())
+            .background(PKGTheme.background.ignoresSafeArea())
             .navigationBarHidden(true)
             .sheet(isPresented: $showFilePicker) {
                 PKGDocumentPicker { urls in
@@ -461,7 +466,7 @@ struct ContentView: View {
                 .frame(maxWidth: 330)
                 .background(
                     RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .fill(Color(.secondarySystemGroupedBackground))
+                        .fill(PKGTheme.surface)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 24, style: .continuous)
@@ -484,6 +489,20 @@ struct ContentView: View {
             modeButton(.usb, title: "USB", icon: "cable.connector")
         }
         .padding(5)
+        .background(cardBackground)
+    }
+
+    private var usbPayloadStatusCard: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "bolt.horizontal.circle.fill").foregroundStyle(.green).font(.title3)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(t("USB Payload", "بايلود USB")).font(.caption).foregroundStyle(.secondary)
+                Text(PayloadManager.shared.activePayloadName()).font(.subheadline.weight(.semibold))
+            }
+            Spacer()
+            Text(PayloadManager.shared.bundledVersion()).font(.caption.monospaced()).foregroundStyle(.secondary)
+        }
+        .padding(13)
         .background(cardBackground)
     }
 
@@ -2359,11 +2378,7 @@ struct ContentView: View {
             cornerRadius: 18,
             style: .continuous
         )
-        .fill(
-            Color(
-                .secondarySystemGroupedBackground
-            )
-        )
+        .fill(PKGTheme.surface)
     }
 
     // ======================================================
@@ -2570,7 +2585,14 @@ struct ContentView: View {
         }
 
         // Keep the bridge pointed at exactly the file shown in Home, then arm it.
-        // The PS4 payload can already be running: it waits on INFO until this flag is set.
+        // Progress comes from unique READ ranges requested by the PS4 payload, so
+        // BGFT retries/probes do not inflate the percentage.
+        USBBridgeServer.shared.setTransferObserver { snapshot in
+            DispatchQueue.main.async {
+                guard self.isSending else { return }
+                self.applyUSBTransferSnapshot(snapshot)
+            }
+        }
         USBBridgeServer.shared.setSelectedFile(file)
         USBBridgeServer.shared.armSelectedFile()
 
@@ -2583,9 +2605,104 @@ struct ContentView: View {
         isSending = true
         UIApplication.shared.isIdleTimerDisabled = true
         status = t(
-            "USB transfer armed. Waiting for the PS4 payload…",
-            "تم تجهيز نقل USB. بانتظار بايلود البلايستيشن…"
+            "USB ready. Sending selected payload to GoldHEN…",
+            "USB جاهز. جارٍ إرسال البايلود المختار إلى GoldHEN…"
         )
+
+        PayloadManager.shared.sendBuiltInPayload(host: psIP) { result in
+            switch result {
+            case .success:
+                status = t(
+                    "Payload sent. Waiting for the PS4 USB bridge…",
+                    "تم إرسال البايلود. بانتظار اتصال USB من البلايستيشن…"
+                )
+            case .failure(let error):
+                USBBridgeServer.shared.disarm()
+                isSending = false
+                UIApplication.shared.isIdleTimerDisabled = false
+                status = t(
+                    "Could not start USB payload: \(error.localizedDescription) Make sure GoldHEN BinLoader is enabled on port 9090.",
+                    "تعذر تشغيل بايلود USB: \(error.localizedDescription) تأكد أن GoldHEN BinLoader مفعّل على المنفذ 9090."
+                )
+            }
+        }
+    }
+
+    private func applyUSBTransferSnapshot(_ transfer: USBTransferSnapshot) {
+        progress = transfer.fraction
+        sentBytes = transfer.sentBytes
+        totalBytes = transfer.totalBytes
+        speed = transfer.bytesPerSecond
+        remainingSeconds = transfer.remainingSeconds
+
+        if let current = activeQueueIndex, packageQueue.indices.contains(current) {
+            let itemID = packageQueue[current].id
+            queueItemProgress[itemID] = transfer.fraction
+            queueItemSpeed[itemID] = transfer.bytesPerSecond
+            queueItemSentBytes[itemID] = transfer.sentBytes
+            queueItemTotalBytes[itemID] = transfer.totalBytes
+        }
+
+        if transfer.bytesPerSecond > 0 {
+            speedSamplesTotal += transfer.bytesPerSecond
+            speedSamplesCount += 1
+            peakSpeed = max(peakSpeed, transfer.bytesPerSecond)
+        }
+
+        if transfer.fraction >= 1 {
+            finishUSBTransfer()
+        } else if transfer.sentBytes > 0 {
+            status = t("Transferring package over USB…", "جارٍ نقل ملف PKG عبر USB…")
+        }
+    }
+
+    private func finishUSBTransfer() {
+        guard isSending else { return }
+
+        USBBridgeServer.shared.disarm()
+        if let current = activeQueueIndex, packageQueue.indices.contains(current) {
+            let itemID = packageQueue[current].id
+            queueCompletedItemIDs.insert(itemID)
+            queueItemProgress[itemID] = 1
+            queueItemSpeed[itemID] = speed
+            queueItemSentBytes[itemID] = totalBytes
+            queueItemTotalBytes[itemID] = totalBytes
+        }
+
+        progress = 1
+        sentBytes = totalBytes
+        completed = true
+        isSending = false
+        UIApplication.shared.isIdleTimerDisabled = false
+        saveHistory(completed: true)
+        status = t("USB transfer completed successfully.", "اكتمل نقل USB بنجاح.")
+
+        if queueRunning, let current = activeQueueIndex {
+            let next = current + 1
+            if packageQueue.indices.contains(next) {
+                status = t(
+                    "Package \(current + 1) completed. Starting \(next + 1) of \(packageQueue.count)…",
+                    "اكتمل الملف \(current + 1). جارٍ بدء \(next + 1) من \(packageQueue.count)…"
+                )
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                    self.startQueuePackage(at: next)
+                }
+            } else {
+                queueRunning = false
+                activeQueueIndex = nil
+                let finishedURLs = packageQueue.map { $0.url }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                    self.cleanupStagedPackages(finishedURLs)
+                    self.packageQueue.removeAll()
+                }
+                status = t("Install queue completed successfully.", "اكتملت قائمة التثبيت بنجاح.")
+            }
+        } else if let file = selectedFile {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                self.cleanupStagedPackages([file])
+                if self.packageQueue.count == 1 { self.packageQueue.removeAll() }
+            }
+        }
     }
 
     private func sendCurrentPackage() {
@@ -2859,7 +2976,10 @@ struct ContentView: View {
 
     private func cancelTransfer() {
 
-        if transferMode == .usb { USBBridgeServer.shared.disarm() }
+        if transferMode == .usb {
+            USBBridgeServer.shared.disarm()
+            USBBridgeServer.shared.setTransferObserver(nil)
+        }
 
         // Save history BEFORE
         // resetting transfer data.
@@ -2990,7 +3110,10 @@ struct ContentView: View {
                     selectedMetadata?.kind.rawValue,
 
                 iconData:
-                    historyThumbnailData(from: selectedMetadata?.iconData)
+                    historyThumbnailData(from: selectedMetadata?.iconData),
+
+                transferType:
+                    transferMode == .usb ? "USB" : "Network"
             )
 
         historyStore.add(
@@ -3584,7 +3707,7 @@ struct HistoryView: View {
                     }
                 }
             }
-            .background(Color(.systemGroupedBackground).ignoresSafeArea())
+            .background(PKGTheme.background.ignoresSafeArea())
             .navigationBarHidden(true)
             .alert(isArabic ? "مسح سجل الإرسالات؟" : "Clear Transfer History?", isPresented: $showClearAlert) {
                 Button(isArabic ? "إلغاء" : "Cancel", role: .cancel) { }
@@ -3651,7 +3774,7 @@ struct HistoryView: View {
                 }.padding().transition(.opacity)
             }
         }
-        .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color(.secondarySystemGroupedBackground)))
+        .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(PKGTheme.surface))
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
@@ -3699,13 +3822,14 @@ struct HistoryView: View {
             if let contentID = item.contentID, !contentID.isEmpty { historyDetail(icon: "number", title: "Content ID", value: contentID) }
             historyDetail(icon: "externaldrive.fill", title: isArabic ? "حجم الملف" : "File Size", value: formatBytes(item.totalBytes))
             historyDetail(icon: "arrow.up.arrow.down", title: isArabic ? "تم نقله" : "Transferred", value: "\(formatBytes(item.transferredBytes)) / \(formatBytes(item.totalBytes))")
+            if let transferType = item.transferType { historyDetail(icon: transferType == "USB" ? "cable.connector" : "network", title: isArabic ? "نوع النقل" : "Transfer Type", value: transferType) }
             historyDetail(icon: "speedometer", title: isArabic ? "متوسط السرعة" : "Average Speed", value: formatSpeed(item.averageSpeed))
             if let peak = item.peakSpeed, peak > 0 {
                 historyDetail(icon: "gauge.with.dots.needle.67percent", title: isArabic ? "أعلى سرعة" : "Peak Speed", value: formatSpeed(peak))
             }
             historyDetail(icon: "timer", title: item.completed ? (isArabic ? "مدة النقل" : "Transfer Time") : (isArabic ? "المدة قبل الإلغاء" : "Time Before Cancellation"), value: formatDuration(item.duration))
             historyDetail(icon: "calendar", title: isArabic ? "التاريخ والوقت" : "Date & Time", value: fullDate(item.date))
-        }.padding(12).background(RoundedRectangle(cornerRadius: 14).fill(Color(.tertiarySystemGroupedBackground)))
+        }.padding(12).background(RoundedRectangle(cornerRadius: 14).fill(PKGTheme.elevatedSurface))
     }
 
     private func historyDetail(icon: String, title: String, value: String) -> some View {
@@ -3749,7 +3873,9 @@ struct HistoryView: View {
 struct SettingsView: View {
     @Binding var appLanguage: String
     @Binding var psPort: String
-    @AppStorage("libraryAppearance") private var libraryAppearance = "modern"
+    @AppStorage("libraryAppearance") private var libraryAppearance = "minimalist"
+    @AppStorage("appTheme") private var appTheme = "charcoal"
+    @AppStorage("gameHubAppearance") private var gameHubAppearance = "original"
 
     private var isArabic: Bool { appLanguage == "ar" }
     private func t(_ en: String, _ ar: String) -> String { isArabic ? ar : en }
@@ -3761,8 +3887,8 @@ struct SettingsView: View {
                     UnifiedPageHeader(title: t("Settings", "الإعدادات"), subtitle: t("Make PKG Sender yours", "خصص PKG Sender بطريقتك"))
 
                     settingsGroup(t("GENERAL", "عام")) {
-                        NavigationLink { LibraryAppearanceSettings(isArabic: isArabic, selection: $libraryAppearance) } label: {
-                            settingsRow(icon: "books.vertical.fill", tint: .indigo, title: t("Library Appearance", "مظهر المكتبة"), value: libraryAppearance == "classic" ? t("Classic", "كلاسيكي") : t("Modern", "حديث"))
+                        NavigationLink { AppearanceSettings(isArabic: isArabic, appTheme: $appTheme, libraryAppearance: $libraryAppearance, gameHubAppearance: $gameHubAppearance) } label: {
+                            settingsRow(icon: "paintpalette.fill", tint: .indigo, title: t("Appearance", "المظهر"), value: t("Theme • Library • Game Hub", "الثيم • المكتبة • مركز اللعبة"))
                         }
                         rowDivider
                         NavigationLink { LanguageSettings(appLanguage: $appLanguage) } label: {
@@ -3775,6 +3901,10 @@ struct SettingsView: View {
                     }
 
                     settingsGroup(t("SUPPORT & ADVANCED", "الدعم والمتقدم")) {
+                        NavigationLink { PayloadSettingsView(isArabic: isArabic) } label: {
+                            settingsRow(icon: "bolt.horizontal.circle.fill", tint: .green, title: t("USB Payload", "بايلود USB"), value: PayloadManager.shared.hasCustomPayload ? t("Custom", "يدوي") : PayloadManager.shared.bundledVersion())
+                        }
+                        rowDivider
                         NavigationLink { DiagnosticsView(appLanguage: appLanguage) } label: {
                             settingsRow(icon: "stethoscope", tint: .orange, title: t("Diagnostics & Errors", "التشخيص والأخطاء"))
                         }
@@ -3787,19 +3917,19 @@ struct SettingsView: View {
                     VStack(alignment: .leading, spacing: 7) {
                         Text(t("LIBRARY PREVIEW", "معاينة المكتبة")).font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.horizontal, 4)
                         HStack(spacing: 12) {
-                            Image(systemName: libraryAppearance == "modern" ? "rectangle.grid.2x2.fill" : "rectangle.grid.3x2.fill").font(.system(size: 25, weight: .semibold)).foregroundStyle(.blue).frame(width: 48, height: 48).background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
+                            Image(systemName: "rectangle.grid.2x2.fill").font(.system(size: 25, weight: .semibold)).foregroundStyle(.blue).frame(width: 48, height: 48).background(Color.blue.opacity(0.12), in: RoundedRectangle(cornerRadius: 14))
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(libraryAppearance == "modern" ? t("Modern Library", "المكتبة الحديثة") : t("Classic Library", "المكتبة الكلاسيكية")).font(.headline)
+                                Text(t("Library style", "تشكيلة المكتبة") + ": " + libraryAppearance.capitalized).font(.headline)
                                 Text(t("Both layouts open the same Game Hub.", "كلا التصميمين يفتحان نفس مركز اللعبة.")).font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                        }.padding(15).background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                        }.padding(15).background(PKGTheme.surface, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
                     }
                     Spacer(minLength: 110)
                 }
                 .padding(.horizontal, 18).padding(.top, 8)
             }
-            .background(Color(.systemBackground))
+            .background(PKGTheme.background.ignoresSafeArea())
             .navigationBarHidden(true)
         }
         .environment(\.layoutDirection, isArabic ? .rightToLeft : .leftToRight)
@@ -3811,7 +3941,7 @@ struct SettingsView: View {
             Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.horizontal, 4)
             VStack(spacing: 0) { content() }
                 .padding(.horizontal, 13)
-                .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .background(PKGTheme.surface, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Color.primary.opacity(0.055), lineWidth: 0.7))
         }
     }
@@ -3829,6 +3959,232 @@ struct SettingsView: View {
     private var rowDivider: some View { Divider().opacity(0.14).padding(.leading, 46) }
 }
 
+
+private struct PayloadSettingsView: View {
+    let isArabic: Bool
+    @State private var showImporter = false
+    @State private var refreshToken = UUID()
+    @State private var message: String?
+    @State private var showRestore = false
+
+    private func t(_ en: String, _ ar: String) -> String { isArabic ? ar : en }
+    private var manager: PayloadManager { .shared }
+
+    var body: some View {
+        List {
+            Section {
+                HStack(spacing: 12) {
+                    Image(systemName: manager.hasCustomPayload ? "bolt.horizontal.fill" : "shippingbox.fill")
+                        .foregroundStyle(manager.hasCustomPayload ? Color.green : Color.blue)
+                        .frame(width: 28)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(t("Active Payload", "البايلود الحالي")).font(.headline)
+                        Text(manager.activePayloadName()).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                }.padding(.vertical, 4)
+            } header: {
+                Text(t("USB PAYLOAD", "بايلود USB"))
+            } footer: {
+                Text(t("A manually imported ELF is copied into PKG Sender and stays selected until you restore the built-in payload.",
+                       "ملف ELF الذي تضيفه يدويًا يُنسخ داخل PKG Sender ويظل هو المختار حتى ترجع للبايلود المدمج."))
+            }
+
+            Section {
+                Button {
+                    showImporter = true
+                } label: {
+                    Label(t("Choose ELF Manually", "اختيار ELF يدويًا"), systemImage: "folder.badge.plus")
+                }
+
+                if manager.hasCustomPayload {
+                    Button(role: .destructive) {
+                        showRestore = true
+                    } label: {
+                        Label(t("Restore Built-in Payload", "الرجوع للبايلود المدمج"), systemImage: "arrow.uturn.backward.circle")
+                    }
+                }
+            }
+
+            if let message {
+                Section {
+                    Text(message).font(.footnote).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .id(refreshToken)
+        .navigationTitle(t("USB Payload", "بايلود USB"))
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showImporter) {
+            PKGDocumentPicker { urls in
+                guard let url = urls.first else {
+                    showImporter = false
+                    return
+                }
+                do {
+                    try manager.importCustomPayload(from: url)
+                    message = t("Custom ELF selected. The next USB transfer will inject it automatically.",
+                                "تم اختيار ELF اليدوي. النقل القادم عبر USB سيحقنه تلقائيًا.")
+                    refreshToken = UUID()
+                } catch {
+                    message = error.localizedDescription
+                }
+                showImporter = false
+            }
+        }
+        .alert(t("Restore built-in payload?", "الرجوع للبايلود المدمج؟"), isPresented: $showRestore) {
+            Button(t("Cancel", "إلغاء"), role: .cancel) {}
+            Button(t("Restore", "رجوع"), role: .destructive) {
+                do {
+                    try manager.restoreBuiltInPayload()
+                    message = t("Built-in payload restored.", "تم الرجوع للبايلود المدمج.")
+                    refreshToken = UUID()
+                } catch {
+                    message = error.localizedDescription
+                }
+            }
+        }
+    }
+}
+
+private struct AppearanceSettings: View {
+    let isArabic: Bool
+    @Binding var appTheme: String
+    @Binding var libraryAppearance: String
+    @Binding var gameHubAppearance: String
+
+    private func t(_ en: String, _ ar: String) -> String { isArabic ? ar : en }
+    private var libraryAppearanceName: String {
+        switch libraryAppearance {
+        case "og", "classic": return t("OG", "الأصلي")
+        case "showcase": return t("Showcase", "استعراضي")
+        case "compact": return t("Compact", "مضغوط")
+        case "list": return t("List", "قائمة")
+        case "coverflow": return t("Cover Flow", "تدفق الأغلفة")
+        default: return t("Minimalist", "بسيط")
+        }
+    }
+    private var gameHubAppearanceName: String {
+        gameHubAppearance == "showcase" ? t("Showcase", "استعراضي") : t("Original", "أصلي")
+    }
+
+    var body: some View {
+        List {
+            Section {
+                appearanceChoice(
+                    id: "charcoal",
+                    selection: $appTheme,
+                    icon: "moon.stars.fill",
+                    title: t("Charcoal", "فحمي"),
+                    subtitle: t("Dark navy and charcoal appearance", "مظهر فحمي وكحلي داكن")
+                )
+                appearanceChoice(
+                    id: "black",
+                    selection: $appTheme,
+                    icon: "circle.fill",
+                    title: t("Black", "أسود"),
+                    subtitle: t("Original deep black appearance", "المظهر الأسود الأصلي")
+                )
+                appearanceChoice(
+                    id: "light",
+                    selection: $appTheme,
+                    icon: "sun.max.fill",
+                    title: t("Light", "فاتح"),
+                    subtitle: t("Bright system appearance", "مظهر النظام الفاتح")
+                )
+                appearanceChoice(
+                    id: "system",
+                    selection: $appTheme,
+                    icon: "iphone",
+                    title: t("System", "النظام"),
+                    subtitle: t("Follow iPhone appearance", "يتبع مظهر الآيفون")
+                )
+            } header: {
+                Text(t("THEME", "الثيم"))
+            }
+
+            Section {
+                NavigationLink {
+                    LibraryAppearanceSettings(isArabic: isArabic, selection: $libraryAppearance)
+                } label: {
+                    appearanceRow(
+                        icon: "rectangle.grid.2x2.fill",
+                        title: t("Library", "المكتبة"),
+                        value: libraryAppearanceName
+                    )
+                }
+
+                NavigationLink {
+                    GameHubAppearanceSettings(isArabic: isArabic, selection: $gameHubAppearance)
+                } label: {
+                    appearanceRow(
+                        icon: "gamecontroller.fill",
+                        title: t("Game Hub", "مركز اللعبة"),
+                        value: gameHubAppearanceName
+                    )
+                }
+            } header: {
+                Text(t("PAGES", "الصفحات"))
+            }
+        }
+        .navigationTitle(t("Appearance", "المظهر"))
+        .navigationBarTitleDisplayMode(.inline)
+        .environment(\.layoutDirection, isArabic ? .rightToLeft : .leftToRight)
+    }
+
+    private func appearanceChoice(
+        id: String,
+        selection: Binding<String>,
+        icon: String,
+        title: String,
+        subtitle: String
+    ) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                selection.wrappedValue = id
+            }
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .font(.title3)
+                    .frame(width: 32)
+                    .foregroundStyle(selection.wrappedValue == id ? Color.accentColor : Color.secondary)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(.headline).foregroundStyle(.primary)
+                    Text(subtitle).font(.caption).foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                if selection.wrappedValue == id {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.blue)
+                }
+            }
+            .padding(.vertical, 5)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func appearanceRow(icon: String, title: String, value: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.title3)
+                .frame(width: 32)
+                .foregroundStyle(Color.accentColor)
+            Text(title).font(.headline).foregroundStyle(.primary)
+            Spacer()
+            Text(value).font(.subheadline).foregroundStyle(.secondary)
+            Image(systemName: "chevron.forward")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 5)
+    }
+}
+
 private struct LibraryAppearanceSettings: View {
     let isArabic: Bool
     @Binding var selection: String
@@ -3836,11 +4192,40 @@ private struct LibraryAppearanceSettings: View {
     var body: some View {
         List {
             Section {
-                choice("modern", icon: "rectangle.grid.2x2.fill", title: t("Modern", "حديث"), subtitle: t("Large artwork, cleaner collection view", "أغلفة أكبر وعرض أنظف للمجموعة"))
-                choice("classic", icon: "rectangle.grid.3x2.fill", title: t("Classic", "كلاسيكي"), subtitle: t("Original PKG Sender library layout", "تصميم مكتبة PKG Sender الأصلي"))
+                choice("og", icon: "rectangle.grid.3x2.fill", title: t("OG", "الأصلي"), subtitle: t("Original PKG Sender library layout", "تصميم مكتبة PKG Sender الأصلي"))
+                choice("minimalist", icon: "square.grid.2x2.fill", title: t("Minimalist", "بسيط"), subtitle: t("Clean artwork-first grid", "شبكة نظيفة تركز على الأغلفة"))
+                choice("showcase", icon: "rectangle.grid.1x2.fill", title: t("Showcase", "استعراضي"), subtitle: t("Large featured artwork with a focused title card", "غلاف بارز كبير مع بطاقة اسم هادئة"))
+                choice("compact", icon: "square.grid.4x3.fill", title: t("Compact", "مضغوط"), subtitle: t("More games on screen at once", "ألعاب أكثر في الشاشة في نفس الوقت"))
+                choice("list", icon: "list.bullet.rectangle.fill", title: t("List", "قائمة"), subtitle: t("Detailed vertical library list", "قائمة عمودية بتفاصيل أوضح"))
+                choice("coverflow", icon: "rectangle.stack.fill", title: t("Cover Flow", "تدفق الأغلفة"), subtitle: t("Swipe through large game covers", "تنقل بين أغلفة الألعاب الكبيرة"))
             } footer: { Text(t("This only changes how games are displayed. Both styles use the same library data and Game Hub.", "هذا يغير طريقة عرض الألعاب فقط. كلا التصميمين يستخدمان نفس بيانات المكتبة ونفس مركز اللعبة.")) }
         }
         .navigationTitle(t("Library Appearance", "مظهر المكتبة"))
+        .navigationBarTitleDisplayMode(.inline)
+    }
+    private func choice(_ id: String, icon: String, title: String, subtitle: String) -> some View {
+        Button { withAnimation(.easeInOut(duration: 0.2)) { selection = id } } label: {
+            HStack(spacing: 12) {
+                Image(systemName: icon).font(.title3).frame(width: 32).foregroundStyle(selection == id ? Color.accentColor : Color.secondary)
+                VStack(alignment: .leading, spacing: 3) { Text(title).font(.headline).foregroundStyle(.primary); Text(subtitle).font(.caption).foregroundStyle(.secondary) }
+                Spacer(); if selection == id { Image(systemName: "checkmark.circle.fill").foregroundStyle(.blue) }
+            }.padding(.vertical, 5)
+        }.buttonStyle(.plain)
+    }
+}
+
+private struct GameHubAppearanceSettings: View {
+    let isArabic: Bool
+    @Binding var selection: String
+    private func t(_ en: String, _ ar: String) -> String { isArabic ? ar : en }
+    var body: some View {
+        List {
+            Section {
+                choice("original", icon: "gamecontroller.fill", title: t("Original", "أصلي"), subtitle: t("Original Game Hub layout", "تصميم مركز اللعبة الأصلي"))
+                choice("showcase", icon: "sparkles.rectangle.stack.fill", title: t("Showcase", "استعراضي"), subtitle: t("Large hero artwork and richer game details", "غلاف كبير وتفاصيل أغنى للعبة"))
+            }
+        }
+        .navigationTitle(t("Game Hub Appearance", "مظهر مركز اللعبة"))
         .navigationBarTitleDisplayMode(.inline)
     }
     private func choice(_ id: String, icon: String, title: String, subtitle: String) -> some View {

@@ -3,7 +3,10 @@ import SwiftUI
 struct LibraryView: View {
     @ObservedObject var store: LibraryStore
     let appLanguage: String
+    let psIP: String
     @Binding var detailsPackages: [LibraryPackage]?
+    let historyItems: [TransferHistoryItem]
+    @Binding var transferMode: TransferMode
     let onSendPackage: (LibraryPackage) -> Void
     let onQueuePackage: (LibraryPackage) -> Void
     let onGoHome: () -> Void
@@ -12,9 +15,23 @@ struct LibraryView: View {
     @State private var searchText = ""
     @State private var featuredKey: String? = nil
     @State private var isSearchExpanded = false
+    @State private var selectedSection: LibrarySection = .games
+    @AppStorage("libraryAppearance") private var libraryAppearance = "minimalist"
+    @AppStorage("appTheme") private var appTheme = "charcoal"
+    @AppStorage("gameHubAppearance") private var gameHubAppearance = "original"
     @FocusState private var isSearchFocused: Bool
 
+    private enum LibrarySection {
+        case games
+        case tools
+    }
+
     private var isArabic: Bool { appLanguage == "ar" }
+    private var libraryStyle: String {
+        if libraryAppearance == "classic" { return "og" }
+        if libraryAppearance == "modern" { return "minimalist" }
+        return libraryAppearance
+    }
     private func t(_ en: String, _ ar: String) -> String { isArabic ? ar : en }
 
     private struct GameGroup: Identifiable {
@@ -26,7 +43,7 @@ struct LibraryView: View {
         var displayPackage: LibraryPackage { packages.first(where: { $0.kind == .game }) ?? packages[0] }
     }
 
-    private var groups: [GameGroup] {
+    private var allGroups: [GameGroup] {
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let visible = q.isEmpty ? store.packages : store.packages.filter {
             $0.title.lowercased().contains(q) || $0.titleID.lowercased().contains(q) || $0.fileName.lowercased().contains(q)
@@ -45,29 +62,58 @@ struct LibraryView: View {
         }.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
     }
 
+    private var groups: [GameGroup] {
+        allGroups.filter { group in
+            selectedSection == .tools ? isToolGroup(group) : !isToolGroup(group)
+        }
+    }
+
+    private var gamesCount: Int { allGroups.filter { !isToolGroup($0) }.count }
+    private var toolsCount: Int { allGroups.filter { isToolGroup($0) }.count }
+
+    private func isToolGroup(_ group: GameGroup) -> Bool {
+        if group.packages.contains(where: { $0.kind == .other }) { return true }
+
+        let text = group.packages.map {
+            "\($0.title) \($0.fileName) \($0.contentID)".lowercased()
+        }.joined(separator: " ")
+
+        let toolHints = [
+            "homebrew", "goldhen", "itemzflow", "itemz flow", "apollo",
+            "ftp", "file manager", "file explorer", "ps4 explorer",
+            "remote package installer", "package installer", "payload",
+            "toolbox", "debug settings", "ps4 xplorer"
+        ]
+        return toolHints.contains { text.contains($0) }
+    }
+
     private let gridSpacing: CGFloat = 8
 
 
     var body: some View {
-        NavigationView {
+        ZStack {
+            PKGTheme.background.ignoresSafeArea()
+            NavigationStack {
             Group {
                 if store.isScanning && store.packages.isEmpty {
                     VStack(spacing: 14) {
                         ProgressView(value: store.scanProgress).frame(maxWidth: 240)
                         Text(t("Reading PKG library…", "جارٍ قراءة مكتبة PKG…")).foregroundColor(.secondary)
                     }
-                } else if groups.isEmpty {
+                } else if store.packages.isEmpty {
                     VStack(spacing: 12) {
                         Image(systemName: "books.vertical").font(.system(size: 42)).foregroundColor(.secondary)
                         Text(t("Your library is empty", "المكتبة فارغة")).font(.headline)
                         Text(t("Put .pkg files in Files → PKG Sender → PKG Sender, then refresh the library.", "ضع ملفات .pkg داخل الملفات ← PKG Sender ← PKG Sender، ثم حدّث المكتبة."))
-                            .font(.subheadline).foregroundColor(.secondary).multilineTextAlignment(.center).padding(.horizontal, 28)
+                            .font(.subheadline).foregroundColor(.secondary).multilineTextAlignment(.leading).padding(.horizontal, 28)
                     }
                 } else {
                     GeometryReader { proxy in
                         let horizontalPadding: CGFloat = 12
-                        let cardWidth = max(0, (proxy.size.width - (horizontalPadding * 2) - (gridSpacing * 2)) / 3)
-                        let columns = Array(repeating: GridItem(.fixed(cardWidth), spacing: gridSpacing), count: 3)
+                        let columnCount = libraryStyle == "compact" ? 4 : (libraryStyle == "list" ? 1 : 3)
+                        let totalSpacing = gridSpacing * CGFloat(columnCount - 1)
+                        let cardWidth = max(0, (proxy.size.width - (horizontalPadding * 2) - totalSpacing) / CGFloat(columnCount))
+                        let columns = Array(repeating: GridItem(.fixed(cardWidth), spacing: gridSpacing), count: columnCount)
 
                         let featured = groups.first(where: { $0.key == featuredKey }) ?? groups.first
 
@@ -75,17 +121,24 @@ struct LibraryView: View {
                             // Header + Featured stay visible. Only the game library below scrolls.
                             LibraryCompactHeader(
                                 title: t("Library", "المكتبة"),
-                                gameCount: groups.count,
+                                itemCount: selectedSection == .tools ? toolsCount : gamesCount,
+                                showingTools: selectedSection == .tools,
                                 isArabic: isArabic,
                                 searchText: $searchText,
                                 isSearchExpanded: $isSearchExpanded,
                                 isSearchFocused: $isSearchFocused,
                                 isScanning: store.isScanning,
+                                onToggleSection: {
+                                    withAnimation(.easeInOut(duration: 0.20)) {
+                                        selectedSection = selectedSection == .games ? .tools : .games
+                                        featuredKey = nil
+                                    }
+                                },
                                 onRefresh: { store.scan() }
                             )
                             .padding(.horizontal, horizontalPadding)
 
-                            if let featured {
+                            if libraryStyle == "og", let featured {
                                 FeaturedLibraryCard(
                                     store: store,
                                     packages: featured.packages,
@@ -93,6 +146,8 @@ struct LibraryView: View {
                                     titleID: featured.titleID,
                                     iconData: store.iconData(for: featured.displayPackage),
                                     isArabic: isArabic,
+                                    isUtility: selectedSection == .tools,
+                                    utilityVersion: featured.packages.first(where: { !$0.version.isEmpty })?.version ?? "",
                                     onShowDetails: {
                                         withAnimation(.spring(response: 0.38, dampingFraction: 0.88)) {
                                             detailsPackages = featured.packages
@@ -102,38 +157,102 @@ struct LibraryView: View {
                                 .padding(.horizontal, horizontalPadding)
                             }
 
-                            // All Games is the floating divider. The grid scrolls behind this edge.
-                            HStack(spacing: 10) {
-                                Rectangle()
-                                    .fill(Color.primary.opacity(0.10))
-                                    .frame(height: 0.5)
-                                Text(t("All Games", "كل الألعاب"))
-                                    .font(.system(size: 13, weight: .semibold, design: .rounded))
-                                    .foregroundColor(.secondary)
-                                    .fixedSize()
-                                Rectangle()
-                                    .fill(Color.primary.opacity(0.10))
-                                    .frame(height: 0.5)
+                            if libraryStyle == "og" {
+                                HStack(spacing: 10) {
+                                    Rectangle().fill(Color.primary.opacity(0.10)).frame(height: 0.5)
+                                    Text(selectedSection == .tools ? t("Utility", "الأدوات") : t("All Games", "كل الألعاب"))
+                                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                                        .foregroundColor(.secondary)
+                                        .fixedSize()
+                                    Rectangle().fill(Color.primary.opacity(0.10)).frame(height: 0.5)
+                                }
+                                .padding(.horizontal, horizontalPadding + 8)
                             }
-                            .padding(.horizontal, horizontalPadding + 8)
 
                             ScrollView {
-                                LazyVGrid(columns: columns, alignment: .center, spacing: 14) {
-                                    ForEach(groups) { group in
-                                        Button {
-                                            withAnimation(.easeInOut(duration: 0.20)) {
-                                                featuredKey = group.key
+                                if groups.isEmpty {
+                                    VStack(spacing: 10) {
+                                        Image(systemName: selectedSection == .tools ? "wrench.and.screwdriver" : "gamecontroller")
+                                            .font(.system(size: 32))
+                                            .foregroundColor(.secondary)
+                                        Text(selectedSection == .tools ? t("No tools or homebrew detected yet", "لم يتم اكتشاف أدوات أو هومبرو بعد") : t("No games found", "لم يتم العثور على ألعاب"))
+                                            .font(.subheadline.weight(.medium))
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.top, 36)
+                                }
+
+                                Group {
+                                    if libraryStyle == "list" {
+                                        LazyVStack(spacing: 9) {
+                                            ForEach(groups) { group in
+                                                Button { detailsPackages = group.packages } label: {
+                                                    LibraryListRow(title: group.title, titleID: group.titleID, version: group.packages.first(where: { !$0.version.isEmpty })?.version ?? "", size: group.packages.reduce(0) { $0 + $1.fileSize }, iconData: store.iconData(for: group.displayPackage))
+                                                }.buttonStyle(.plain)
                                             }
-                                        } label: {
-                                            LibraryPosterCard(
-                                                title: group.title,
-                                                iconData: store.iconData(for: group.displayPackage),
-                                                cardWidth: cardWidth,
-                                                isSelected: featured?.key == group.key
-                                            )
                                         }
-                                        .buttonStyle(.plain)
-                                        .frame(width: cardWidth)
+                                    } else if libraryStyle == "coverflow" {
+                                        LibraryCoverFlowView(groups: groups.map { ($0.title, store.iconData(for: $0.displayPackage), $0.packages) }) { packages in detailsPackages = packages }
+                                    } else {
+                                        if libraryStyle == "showcase", let featured {
+                                            // Keep the Showcase hero and the grid in one real vertical layout.
+                                            // This avoids the old reserved/implicit gap between the featured game
+                                            // and the small covers below it.
+                                            VStack(spacing: 0) {
+                                                Button { detailsPackages = featured.packages } label: {
+                                                    LibraryShowcaseCard(iconData: store.iconData(for: featured.displayPackage))
+                                                }
+                                                .buttonStyle(.plain)
+
+                                                Button { detailsPackages = featured.packages } label: {
+                                                    Text(featured.title)
+                                                        .font(.system(size: 21, weight: .bold, design: .rounded))
+                                                        .tracking(0.6)
+                                                        .foregroundStyle(.primary)
+                                                        .lineLimit(2)
+                                                        .minimumScaleFactor(0.72)
+                                                        .multilineTextAlignment(.center)
+                                                        .frame(maxWidth: .infinity, alignment: .center)
+                                                        .padding(.horizontal, 12)
+                                                        .padding(.top, 8)
+                                                }
+                                                .buttonStyle(.plain)
+
+                                                LazyVGrid(columns: columns, alignment: .center, spacing: 14) {
+                                                    ForEach(groups) { group in
+                                                        Button {
+                                                            withAnimation(.spring(response: 0.36, dampingFraction: 0.88)) {
+                                                                featuredKey = group.key
+                                                            }
+                                                        } label: {
+                                                            LibraryPosterCard(title: group.title, iconData: store.iconData(for: group.displayPackage), cardWidth: cardWidth, isSelected: featured.key == group.key)
+                                                        }
+                                                        .buttonStyle(.plain)
+                                                        .frame(width: cardWidth)
+                                                    }
+                                                }
+                                                .padding(.top, 22)
+                                            }
+                                            .transition(.opacity.combined(with: .scale(scale: 0.985)))
+                                            .id(featured.key)
+                                        } else {
+                                            LazyVGrid(columns: columns, alignment: .center, spacing: 14) {
+                                                ForEach(groups) { group in
+                                                    Button {
+                                                        if libraryStyle == "og" {
+                                                            withAnimation(.spring(response: 0.36, dampingFraction: 0.88)) { featuredKey = group.key }
+                                                        } else {
+                                                            detailsPackages = group.packages
+                                                        }
+                                                    } label: {
+                                                        LibraryPosterCard(title: group.title, iconData: store.iconData(for: group.displayPackage), cardWidth: cardWidth, isSelected: featured?.key == group.key)
+                                                    }
+                                                    .buttonStyle(.plain)
+                                                    .frame(width: cardWidth)
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 .frame(maxWidth: .infinity)
@@ -189,50 +308,67 @@ struct LibraryView: View {
                     }
                 }
             }
-            .navigationBarHidden(true)
-        }
-        // Do not animate a live blur across the whole poster grid. Interpolating that
-        // effect was one of the largest frame-time spikes when opening Details.
-        .blur(radius: detailsPackages == nil ? 0 : 7)
-        .animation(nil, value: detailsPackages != nil)
-        .allowsHitTesting(detailsPackages == nil)
-        .overlay {
-            if let packages = detailsPackages, !packages.isEmpty {
-                LibraryDetailsOverlay(
-                    store: store,
-                    packages: packages,
-                    isArabic: isArabic,
-                    isPackageSent: isPackageSent,
-                    isPackageQueued: isPackageQueued,
-                    onSendPackage: onSendPackage,
-                    onQueuePackage: onQueuePackage,
-                    onGoHome: onGoHome,
-                    onClose: { detailsPackages = nil }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(PKGTheme.background.ignoresSafeArea())
+            // IMPORTANT: navigationDestination must live *inside* the NavigationStack.
+            // Keeping it on the NavigationStack itself can be ignored by SwiftUI,
+            // which is why tapping a poster updated state but appeared to do nothing.
+            .navigationDestination(
+                isPresented: Binding(
+                    get: { detailsPackages?.isEmpty == false },
+                    set: { if !$0 { detailsPackages = nil } }
                 )
-                .ignoresSafeArea()
-                .transition(.opacity.combined(with: .scale(scale: 0.985)))
+            ) {
+                if let packages = detailsPackages, !packages.isEmpty {
+                    GameHubView(
+                        store: store,
+                        packages: packages,
+                        historyItems: historyItems,
+                        transferMode: $transferMode,
+                        psIP: psIP,
+                        isArabic: isArabic,
+                        isPackageSent: isPackageSent,
+                        isPackageQueued: isPackageQueued,
+                        onSendPackage: onSendPackage,
+                        onQueuePackage: onQueuePackage,
+                        onGoHome: onGoHome,
+                        onClose: { detailsPackages = nil },
+                        appearance: gameHubAppearance
+                    )
+                }
             }
+            .navigationBarHidden(true)
+            .background(PKGTheme.background.ignoresSafeArea())
+            }
+            .background(PKGTheme.background.ignoresSafeArea())
         }
+        .background(PKGTheme.background.ignoresSafeArea())
         .environment(\.layoutDirection, isArabic ? .rightToLeft : .leftToRight)
     }
 }
 
 private struct LibraryCompactHeader: View {
     let title: String
-    let gameCount: Int
+    let itemCount: Int
+    let showingTools: Bool
     let isArabic: Bool
     @Binding var searchText: String
     @Binding var isSearchExpanded: Bool
     var isSearchFocused: FocusState<Bool>.Binding
     let isScanning: Bool
+    let onToggleSection: () -> Void
     let onRefresh: () -> Void
 
     @State private var refreshAngle: Double = 0
     @State private var refreshTimer: Timer?
 
     private var countText: String {
-        if isArabic { return "\(gameCount) ألعاب" }
-        return "\(gameCount) " + (gameCount == 1 ? "Game" : "Games")
+        if showingTools {
+            if isArabic { return "\(itemCount) أدوات مساعدة" }
+            return "\(itemCount) " + (itemCount == 1 ? "Utility" : "Utilities")
+        }
+        if isArabic { return "\(itemCount) ألعاب" }
+        return "\(itemCount) " + (itemCount == 1 ? "Game" : "Games")
     }
 
     var body: some View {
@@ -278,7 +414,7 @@ private struct LibraryCompactHeader: View {
                 .frame(height: 38)
                 .background(
                     Capsule(style: .continuous)
-                        .fill(Color(.secondarySystemGroupedBackground).opacity(0.92))
+                        .fill(PKGTheme.surface.opacity(0.92))
                 )
                 .transition(.opacity)
             } else {
@@ -293,10 +429,40 @@ private struct LibraryCompactHeader: View {
                     Image(systemName: "magnifyingglass")
                         .font(.system(size: 16, weight: .semibold))
                         .frame(width: 36, height: 36)
-                        .background(Circle().fill(Color(.secondarySystemGroupedBackground).opacity(0.72)))
+                        .background(Circle().fill(PKGTheme.surface.opacity(0.72)))
                 }
                 .buttonStyle(.plain)
                 .transition(.opacity)
+            }
+
+            if !isSearchExpanded {
+                Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    onToggleSection()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: showingTools ? "gamecontroller.fill" : "wrench.and.screwdriver.fill")
+                            .font(.system(size: 11, weight: .bold))
+                        Text(showingTools ? (isArabic ? "كل الألعاب" : "All Games") : (isArabic ? "الأدوات" : "Utility"))
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.horizontal, 10)
+                    .frame(height: 32)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(PKGTheme.surface.opacity(0.82))
+                    )
+                    .overlay(
+                        Capsule(style: .continuous)
+                            .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                    )
+                    .contentShape(Capsule())
+                    .accessibilityLabel(showingTools ? (isArabic ? "كل الألعاب" : "All Games") : (isArabic ? "الأدوات" : "Utility"))
+                }
+                .buttonStyle(.plain)
             }
 
             Button(action: onRefresh) {
@@ -304,7 +470,7 @@ private struct LibraryCompactHeader: View {
                     .font(.system(size: 16, weight: .semibold))
                     .rotationEffect(.degrees(refreshAngle))
                     .frame(width: 36, height: 36)
-                    .background(Circle().fill(Color(.secondarySystemGroupedBackground).opacity(0.72)))
+                    .background(Circle().fill(PKGTheme.surface.opacity(0.72)))
             }
             .buttonStyle(.plain)
             .disabled(isScanning)
@@ -348,6 +514,8 @@ private struct FeaturedLibraryCard: View {
     let titleID: String
     let iconData: Data?
     let isArabic: Bool
+    let isUtility: Bool
+    let utilityVersion: String
     let onShowDetails: () -> Void
 
     private let featuredHeight: CGFloat = 148
@@ -409,11 +577,21 @@ private struct FeaturedLibraryCard: View {
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 6)
 
-                // Keep GAME / UPDATE / DLC / More together on one fixed bottom row.
+                // Games keep their package-type capsules. Utilities use a simpler identity row.
                 HStack(spacing: 5) {
-                    PackageCapsule(title: "GAME", isAvailable: hasGame)
-                    PackageCapsule(title: "UPDATE", isAvailable: hasUpdate)
-                    PackageCapsule(title: "DLC", isAvailable: hasDLC)
+                    if isUtility {
+                        PackageCapsule(title: "UTILITY", isAvailable: true)
+                        if !utilityVersion.isEmpty {
+                            Text(utilityVersion.lowercased().hasPrefix("v") ? utilityVersion : "v\(utilityVersion)")
+                                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                        }
+                    } else {
+                        PackageCapsule(title: "GAME", isAvailable: hasGame)
+                        PackageCapsule(title: "UPDATE", isAvailable: hasUpdate)
+                        PackageCapsule(title: "DLC", isAvailable: hasDLC)
+                    }
 
                     Button(action: onShowDetails) {
                         HStack(spacing: 3.5) {
@@ -439,7 +617,7 @@ private struct FeaturedLibraryCard: View {
         .frame(height: featuredHeight)
         .background {
             ZStack {
-                Color(.secondarySystemGroupedBackground)
+                PKGTheme.surface
 
                 if let image {
                     GeometryReader { proxy in
@@ -513,32 +691,169 @@ private struct LibraryPosterCard: View {
                     Image(uiImage: image).resizable().scaledToFill()
                 } else {
                     ZStack {
-                        Color(.secondarySystemGroupedBackground)
+                        PKGTheme.surface
                         Image(systemName: "shippingbox.fill")
                             .font(.system(size: 20, weight: .semibold))
                             .foregroundColor(.secondary)
                     }
                 }
             }
-            .frame(width: cardWidth, height: cardWidth * 1.12)
+            .frame(width: cardWidth, height: cardWidth * 1.38)
             .clipped()
             .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .stroke(isSelected ? Color.white.opacity(0.72) : Color.white.opacity(0.055),
-                            lineWidth: isSelected ? 1.4 : 0.6)
+                    .stroke(Color.white.opacity(0.055), lineWidth: 0.6)
             )
+            .shadow(color: Color.black.opacity(0.22), radius: 7, x: 0, y: 4)
 
             Text(title)
-                .font(.system(size: 9.5, weight: isSelected ? .semibold : .medium, design: .rounded))
-                .foregroundColor(isSelected ? .primary : .secondary)
+                .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                .foregroundColor(.primary)
                 .lineLimit(2)
                 .minimumScaleFactor(0.72)
-                .multilineTextAlignment(.center)
-                .frame(width: cardWidth, height: 23, alignment: .top)
+                .multilineTextAlignment(.leading)
+                .frame(width: cardWidth, height: 27, alignment: .topLeading)
         }
         .contentShape(Rectangle())
     }
+}
+
+
+private struct LibraryListRow: View {
+    let title: String; let titleID: String; let version: String; let size: UInt64; let iconData: Data?
+    var body: some View {
+        HStack(spacing: 12) {
+            cover.frame(width: 58, height: 80).clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous)).shadow(color: .black.opacity(0.20), radius: 5, y: 3)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title).font(.system(size: 15, weight: .semibold, design: .rounded)).lineLimit(2)
+                if !titleID.isEmpty { Text(titleID).font(.caption2.monospaced()).foregroundStyle(.secondary) }
+                HStack(spacing: 8) { if !version.isEmpty { Text("v\(version)") }; Text(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)) }.font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(); Image(systemName: "chevron.forward").font(.caption.bold()).foregroundStyle(.tertiary)
+        }.padding(10).background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 17, style: .continuous))
+    }
+    @ViewBuilder private var cover: some View { if let d=iconData, let i=UIImage(data:d) { Image(uiImage:i).resizable().scaledToFill() } else { ZStack { Color.secondary.opacity(0.12); Image(systemName:"gamecontroller.fill").foregroundStyle(.secondary) } } }
+}
+
+private struct LibraryShowcaseCard: View {
+    let iconData: Data?
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            Group {
+                if let d = iconData, let i = UIImage(data: d) {
+                    Image(uiImage: i)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    ZStack {
+                        PKGTheme.surface
+                        Image(systemName: "gamecontroller.fill")
+                            .font(.system(size: 50))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 390)
+            .clipped()
+
+            // Same visual treatment as the Game Hub hero: artwork dissolves
+            // naturally into the active Library theme instead of ending as a card.
+            LinearGradient(
+                stops: [
+                    .init(color: .clear, location: 0.58),
+                    .init(color: PKGTheme.background.opacity(0.08), location: 0.70),
+                    .init(color: PKGTheme.background.opacity(0.55), location: 0.86),
+                    .init(color: PKGTheme.background, location: 1.00)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: 390)
+            .allowsHitTesting(false)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 390)
+        .contentShape(Rectangle())
+    }
+}
+
+private struct LibraryCollectionsView: View {
+    let groups: [(String,String,Data?,[LibraryPackage])]; let isArabic: Bool; let open: ([LibraryPackage])->Void
+    var body: some View { VStack(alignment:.leading,spacing:20) { shelf(isArabic ? "كل الألعاب" : "All Games", groups); shelf(isArabic ? "التحديثات" : "Updates", groups.filter{$0.3.contains(where:{$0.kind == .update})}); shelf(isArabic ? "الإضافات" : "DLC", groups.filter{$0.3.contains(where:{$0.kind == .dlc})}) } }
+    @ViewBuilder private func shelf(_ title:String,_ items:[(String,String,Data?,[LibraryPackage])])->some View { if !items.isEmpty { VStack(alignment:.leading,spacing:10){ Text(title).font(.headline); ScrollView(.horizontal,showsIndicators:false){ HStack(spacing:12){ ForEach(Array(items.enumerated()),id:\.offset){ _,g in Button{open(g.3)}label:{ MiniPoster(title:g.0,data:g.2,width:112) }.buttonStyle(.plain) } } } } } }
+}
+
+private struct LibraryShelfView: View {
+    let groups:[(String,Data?,[LibraryPackage])]; let isArabic:Bool; let open:([LibraryPackage])->Void
+    var body:some View { VStack(alignment:.leading,spacing:12){ Text(isArabic ? "المكتبة" : "Your Shelf").font(.headline); ScrollView(.horizontal,showsIndicators:false){ HStack(spacing:15){ ForEach(Array(groups.enumerated()),id:\.offset){ _,g in Button{open(g.2)}label:{ MiniPoster(title:g.0,data:g.1,width:148) }.buttonStyle(.plain) } } } } }
+}
+
+private struct LibraryCoverFlowView: View {
+    let groups:[(String,Data?,[LibraryPackage])]
+    let open:([LibraryPackage])->Void
+    @State private var selection = 0
+
+    var body: some View {
+        GeometryReader { proxy in
+            let coverWidth = min(max(proxy.size.width * 0.82, 286), 326)
+            let coverHeight = coverWidth * 1.40
+
+            VStack(spacing: 8) {
+                TabView(selection: $selection) {
+                    ForEach(Array(groups.enumerated()), id: \.offset) { idx, group in
+                        Button { open(group.2) } label: {
+                            VStack(spacing: 10) {
+                                Group {
+                                    if let data = group.1, let image = UIImage(data: data) {
+                                        Image(uiImage: image).resizable().scaledToFill()
+                                    } else {
+                                        ZStack {
+                                            PKGTheme.surface
+                                            Image(systemName: "gamecontroller.fill").font(.system(size: 50)).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                                .frame(width: coverWidth, height: coverHeight)
+                                .clipped()
+                                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).stroke(Color.white.opacity(0.055), lineWidth: 0.6))
+                                .shadow(color: .black.opacity(0.32), radius: 18, y: 10)
+
+                                Text(group.0)
+                                    .font(.system(size: 18, weight: .semibold, design: .rounded))
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.center)
+                                    .frame(maxWidth: coverWidth)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 4)
+                        }
+                        .buttonStyle(.plain)
+                        .tag(idx)
+                    }
+                }
+                .frame(height: coverHeight + 62)
+                .tabViewStyle(.page(indexDisplayMode: .never))
+                .animation(.spring(response: 0.38, dampingFraction: 0.88), value: selection)
+
+                if groups.count > 1 {
+                    Text("\(selection + 1) / \(groups.count)")
+                        .font(.caption2.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .top)
+        }
+        .frame(height: 535)
+    }
+}
+
+private struct MiniPoster: View {
+    let title:String; let data:Data?; let width:CGFloat
+    var body:some View { VStack(alignment:.leading,spacing:7){ Group{ if let d=data,let i=UIImage(data:d){Image(uiImage:i).resizable().scaledToFill()}else{ZStack{Color.secondary.opacity(0.12);Image(systemName:"gamecontroller.fill").foregroundStyle(.secondary)}}}.frame(width:width,height:width*1.42).clipped().clipShape(RoundedRectangle(cornerRadius:12,style:.continuous)).shadow(color:.black.opacity(0.24),radius:8,y:5); Text(title).font(.caption.weight(.semibold)).lineLimit(2).frame(width:width,alignment:.leading) } }
 }
 
 private struct LibraryGameCard: View {
@@ -596,7 +911,7 @@ private struct LibraryGameCard: View {
                     .foregroundColor(.white.opacity(0.96))
                     .lineLimit(2)
                     .minimumScaleFactor(0.68)
-                    .multilineTextAlignment(.center)
+                    .multilineTextAlignment(.leading)
                     .frame(maxWidth: .infinity, minHeight: 22, alignment: .top)
 
                 Circle()
@@ -729,6 +1044,385 @@ private extension UIImage {
     }
 }
 
+
+
+// MARK: - Game Hub
+struct GameHubView: View {
+    @ObservedObject var store: LibraryStore
+    let packages: [LibraryPackage]
+    let historyItems: [TransferHistoryItem]
+    @Binding var transferMode: TransferMode
+    let psIP: String
+    let isArabic: Bool
+    let isPackageSent: (LibraryPackage) -> Bool
+    let isPackageQueued: (LibraryPackage) -> Bool
+    let onSendPackage: (LibraryPackage) -> Void
+    let onQueuePackage: (LibraryPackage) -> Void
+    let onGoHome: () -> Void
+    let onClose: () -> Void
+    let appearance: String
+
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var ftp = FTPService()
+    @StateObject private var repositories = CheatRepositoryStore()
+    @State private var showDelete = false
+    @State private var ps4Status: PS4Presence = .checking
+    @State private var livePS4Version = ""
+    @State private var cheats: [RemoteCheat] = []
+    @State private var dataError: String?
+
+    private enum PS4Presence: Equatable { case checking, installed, notInstalled, unavailable }
+    private func t(_ en: String, _ ar: String) -> String { isArabic ? ar : en }
+    private var lead: LibraryPackage { packages.first(where: { $0.kind == .game }) ?? packages[0] }
+    private var titleID: String { packages.first(where: { !$0.titleID.isEmpty })?.titleID.uppercased() ?? "" }
+    private var relatedHistory: [TransferHistoryItem] {
+        guard !titleID.isEmpty else { return [] }
+        return historyItems.filter { ($0.titleID ?? "").caseInsensitiveCompare(titleID) == .orderedSame }.sorted { $0.date > $1.date }
+    }
+    private var compatibleCheats: [RemoteCheat] {
+        let source = dedupe(cheats.filter { $0.titleID.caseInsensitiveCompare(titleID) == .orderedSame })
+        guard !livePS4Version.isEmpty else { return source }
+        return source.filter { $0.version.caseInsensitiveCompare(livePS4Version) == .orderedSame }
+    }
+    private var totalSize: UInt64 { packages.reduce(0) { $0 + $1.fileSize } }
+
+    var body: some View {
+        ZStack {
+            PKGTheme.background.ignoresSafeArea()
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 18) {
+                    if appearance == "showcase" { showcaseHero } else { hero }
+                    statusStrip
+                    transferModeSelector
+                    packagesSection
+                    cheatsSection
+                    infoSection
+                    historySection
+                    Spacer(minLength: 34)
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+            }
+            .scrollIndicators(.hidden)
+        }
+        .navigationTitle("")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(.hidden, for: .navigationBar)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Button(role: .destructive) { showDelete = true } label: {
+                        Label(t("Remove from Library", "حذف من المكتبة"), systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 16, weight: .bold))
+                        .frame(width: 34, height: 34)
+                        .background(Color.primary.opacity(0.07), in: Circle())
+                }
+            }
+        }
+        .task(id: titleID) { await refreshHubData() }
+        .alert(t("Remove from Library?", "حذف من المكتبة؟"), isPresented: $showDelete) {
+            Button(t("Cancel", "إلغاء"), role: .cancel) {}
+            Button(t("Remove", "حذف"), role: .destructive) {
+                packages.forEach(store.removeFromLibrary)
+                onClose()
+                dismiss()
+            }
+        } message: {
+            Text(t("Saved metadata will be removed. PKG files will not be deleted.", "سيتم حذف البيانات المحفوظة فقط ولن يتم حذف ملفات PKG."))
+        }
+        .environment(\.layoutDirection, isArabic ? .rightToLeft : .leftToRight)
+    }
+
+    private var hero: some View {
+        VStack(spacing: 14) {
+            Group {
+                if let data = store.iconData(for: lead), let image = UIImage(data: data) {
+                    Image(uiImage: image).resizable().scaledToFill()
+                } else {
+                    ZStack { Color.secondary.opacity(0.12); Image(systemName: "gamecontroller.fill").font(.system(size: 48)).foregroundStyle(.secondary) }
+                }
+            }
+            .frame(width: 176, height: 176).clipped()
+            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+
+            VStack(spacing: 5) {
+                Text(lead.title).font(.system(size: 25, weight: .bold, design: .rounded)).multilineTextAlignment(.leading).lineLimit(2)
+                if !titleID.isEmpty { Text(titleID).font(.system(size: 13, weight: .medium, design: .monospaced)).foregroundStyle(.secondary) }
+                ps4StatusLine
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+
+    private var showcaseHero: some View {
+        ZStack(alignment: .bottomLeading) {
+            Group {
+                if let data = store.iconData(for: lead), let image = UIImage(data: data) {
+                    Image(uiImage: image).resizable().scaledToFill()
+                } else {
+                    ZStack { PKGTheme.surface; Image(systemName: "gamecontroller.fill").font(.system(size: 54)).foregroundStyle(.secondary) }
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 420)
+            .clipped()
+
+            LinearGradient(
+                stops: [
+                    .init(color: .clear, location: 0.24),
+                    .init(color: PKGTheme.background.opacity(0.10), location: 0.48),
+                    .init(color: PKGTheme.background.opacity(0.72), location: 0.73),
+                    .init(color: PKGTheme.background, location: 0.96)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(lead.title)
+                    .font(.system(size: 23, weight: .bold, design: .rounded))
+                    .lineLimit(2)
+                    .shadow(color: .black.opacity(0.45), radius: 7, y: 2)
+                if !titleID.isEmpty {
+                    Text(titleID).font(.caption.monospaced().weight(.semibold)).foregroundStyle(.secondary)
+                }
+                ps4StatusLine
+            }
+            .padding(.horizontal, 18)
+            .padding(.bottom, 18)
+        }
+        .frame(height: 420)
+        .padding(.horizontal, -16)
+        .padding(.top, -8)
+    }
+
+    @ViewBuilder private var ps4StatusLine: some View {
+        HStack(spacing: 7) {
+            switch ps4Status {
+            case .checking:
+                ProgressView().controlSize(.small)
+                Text(t("Checking PS4…", "جارٍ فحص PS4…")).foregroundStyle(.secondary)
+            case .installed:
+                Label(t("Installed", "مثبتة"), systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                if !livePS4Version.isEmpty { Text("• v\(livePS4Version)").foregroundStyle(.secondary) }
+            case .notInstalled:
+                Label(t("Not installed on PS4", "غير مثبتة على PS4"), systemImage: "xmark.circle").foregroundStyle(.secondary)
+            case .unavailable:
+                Label(t("PS4 status unavailable", "حالة PS4 غير متاحة"), systemImage: "wifi.slash").foregroundStyle(.secondary)
+            }
+        }
+        .font(.system(size: 13, weight: .semibold))
+    }
+
+    private var statusStrip: some View {
+        HStack(spacing: 0) {
+            hubStat("shippingbox.fill", "\(packages.count)", t("Packages", "الحزم"))
+            Divider().frame(height: 38)
+            hubStat("externaldrive.fill", byteString(totalSize), t("Total", "الإجمالي"))
+            Divider().frame(height: 38)
+            hubStat("bolt.fill", "\(compatibleCheats.count)", t("Cheats", "الغش"))
+        }
+        .padding(.vertical, 13)
+        .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+    }
+
+    private func hubStat(_ icon: String, _ value: String, _ label: String) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon).font(.system(size: 13, weight: .semibold)).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 14, weight: .bold, design: .rounded)).lineLimit(1).minimumScaleFactor(0.7)
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+        }.frame(maxWidth: .infinity)
+    }
+
+    private var transferModeSelector: some View {
+        HStack(spacing: 6) {
+            hubTransferModeButton(.wifi, title: "Network", icon: "network")
+            hubTransferModeButton(.usb, title: "USB", icon: "cable.connector")
+        }
+        .padding(4)
+        .background(Color.primary.opacity(0.055), in: Capsule())
+    }
+
+    private func hubTransferModeButton(_ mode: TransferMode, title: String, icon: String) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.18)) { transferMode = mode }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                Text(title).font(.subheadline.weight(.semibold))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .foregroundStyle(transferMode == mode ? Color.primary : Color.secondary)
+            .background(transferMode == mode ? Color.primary.opacity(0.10) : Color.clear, in: Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var packagesSection: some View {
+        hubSection(t("Packages", "الحزم"), icon: "shippingbox.fill") {
+            VStack(spacing: 10) {
+                ForEach(packages.sorted { rank($0.kind) < rank($1.kind) }) { p in
+                    HStack(spacing: 12) {
+                        Image(systemName: kindIcon(p.kind)).font(.system(size: 17, weight: .semibold)).frame(width: 30, height: 30).background(Color.accentColor.opacity(0.13), in: RoundedRectangle(cornerRadius: 9))
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(kindName(p.kind)).font(.system(size: 14, weight: .semibold))
+                            Text([p.version.isEmpty ? nil : "v\(p.version)", byteString(p.fileSize)].compactMap{$0}.joined(separator: " • ")).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if !store.isFileAvailable(p) { Text(t("Missing", "مفقود")).font(.caption2.weight(.bold)).foregroundStyle(.orange) }
+                        Menu {
+                            if store.isFileAvailable(p) {
+                                Button { onSendPackage(p); onGoHome(); onClose() } label: { Label(t("Send Now", "إرسال الآن"), systemImage: "paperplane.fill") }
+                                Button { onQueuePackage(p) } label: { Label(t("Add to Queue", "إضافة للطابور"), systemImage: "text.badge.plus") }
+                            }
+                        } label: { Image(systemName: "ellipsis.circle").font(.title3).foregroundStyle(.secondary) }
+                    }
+                    .padding(12).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }
+            }
+        }
+    }
+
+    private var cheatsSection: some View {
+        hubSection(t("Cheats", "الشيتات"), icon: "bolt.fill") {
+            if titleID.isEmpty {
+                Text(t("No Title ID is available for cheat matching.", "لا يوجد Title ID لمطابقة الشيتات."))
+                    .font(.subheadline).foregroundStyle(.secondary)
+            } else if compatibleCheats.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(t("No compatible cheats found.", "لا توجد شيتات متوافقة."))
+                        .font(.subheadline).foregroundStyle(.secondary)
+                    if !cheats.isEmpty && !livePS4Version.isEmpty {
+                        Text("\(cheats.count) \(t("cheats exist for other versions of this CUSA.", "شيت موجود لإصدارات أخرى من نفس CUSA."))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(compatibleCheats.prefix(4).enumerated()), id: \.element.id) { index, cheat in
+                        HStack(spacing: 10) {
+                            Image(systemName: "bolt.circle.fill").foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(cheat.gameName.isEmpty ? cheat.repositoryName : cheat.gameName).font(.subheadline.weight(.semibold)).lineLimit(1)
+                                Text("\(cheat.repositoryName) • v\(cheat.version) • \(cheat.format.uppercased())").font(.caption2).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }.padding(.vertical, 9)
+                        if index < min(compatibleCheats.count, 4) - 1 { Divider().opacity(0.12) }
+                    }
+                    if compatibleCheats.count > 4 {
+                        Text("+\(compatibleCheats.count - 4) \(t("more", "إضافية"))")
+                            .font(.caption.weight(.semibold)).foregroundStyle(.secondary).padding(.top, 8)
+                    }
+                }
+            }
+        }
+    }
+
+    private var infoSection: some View {
+        hubSection(t("Game Information", "معلومات اللعبة"), icon: "info.circle.fill") {
+            VStack(spacing: 0) {
+                infoRow("tag.fill", "Title ID", titleID.isEmpty ? "—" : titleID)
+                infoRow("number", "Content ID", lead.contentID.isEmpty ? "—" : lead.contentID)
+                infoRow("square.grid.2x2", t("Category", "الفئة"), lead.category.isEmpty ? "—" : lead.category.uppercased())
+                infoRow("externaldrive.fill", t("Library Size", "حجم المكتبة"), byteString(totalSize), divider: false)
+            }
+        }
+    }
+
+    private var historySection: some View {
+        hubSection(t("Transfer History", "سجل الإرسال"), icon: "clock.arrow.circlepath") {
+            if relatedHistory.isEmpty {
+                Text(t("No transfers recorded for this title yet.", "لا توجد عمليات إرسال مسجلة لهذه اللعبة بعد."))
+                    .font(.subheadline).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6)
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(relatedHistory.prefix(4)) { item in
+                        HStack(spacing: 10) {
+                            Image(systemName: item.completed ? "checkmark.circle.fill" : "xmark.circle.fill").foregroundStyle(item.completed ? .green : .red)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.packageKind ?? t("Package", "حزمة")).font(.subheadline.weight(.semibold))
+                                Text(item.date.formatted(date: .abbreviated, time: .shortened)).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Text(byteString(item.transferredBytes)).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                        }.padding(.vertical, 9)
+                        if item.id != relatedHistory.prefix(4).last?.id { Divider().opacity(0.12) }
+                    }
+                }
+            }
+        }
+    }
+
+    private func refreshHubData() async {
+        async let cheatTask: Void = loadCheats()
+        async let ps4Task: Void = loadPS4State()
+        _ = await (cheatTask, ps4Task)
+    }
+
+    @MainActor private func loadCheats() async {
+        guard !titleID.isEmpty else { cheats = []; return }
+        cheats = await CheatRepositoryClient.cheats(for: titleID, repositories: repositories.repositories)
+    }
+
+    @MainActor private func loadPS4State() async {
+        let host = psIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !host.isEmpty, !titleID.isEmpty else { ps4Status = .unavailable; return }
+        ps4Status = .checking
+        livePS4Version = ""
+        await ftp.list(host: host, path: "/user/app")
+        guard case .connected = ftp.state else { ps4Status = .unavailable; return }
+        let installed = ftp.entries.contains { $0.isDirectory && $0.name.caseInsensitiveCompare(titleID) == .orderedSame }
+        guard installed else { ps4Status = .notInstalled; return }
+        ps4Status = .installed
+        for path in [
+            "/user/app/\(titleID)/app0/sce_sys/param.sfo",
+            "/system_data/priv/appmeta/\(titleID)/param.sfo",
+            "/user/appmeta/\(titleID)/param.sfo"
+        ] {
+            if let data = try? await ftp.download(host: host, remotePath: path) {
+                let meta = PS4SFO.parse(data)
+                if let version = meta["APP_VER"] ?? meta["VERSION"], !version.isEmpty {
+                    livePS4Version = version
+                    break
+                }
+            }
+        }
+    }
+
+    private func dedupe(_ input: [RemoteCheat]) -> [RemoteCheat] {
+        var seen = Set<String>()
+        return input.filter {
+            seen.insert("\($0.titleID.lowercased())|\($0.version.lowercased())|\($0.format.lowercased())|\($0.fileName.lowercased())").inserted
+        }
+    }
+
+    private func hubSection<Content: View>(_ title: String, icon: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label(title, systemImage: icon).font(.system(size: 16, weight: .bold, design: .rounded))
+            content()
+        }
+        .padding(15).background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(Color.primary.opacity(0.06), lineWidth: 0.7))
+    }
+
+    private func infoRow(_ icon: String, _ label: String, _ value: String, divider: Bool = true) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) { Image(systemName: icon).foregroundStyle(.secondary).frame(width: 20); Text(label).foregroundStyle(.secondary); Spacer(); Text(value).font(.system(size: 13, weight: .medium, design: .rounded)).lineLimit(1).minimumScaleFactor(0.55) }.padding(.vertical, 10)
+            if divider { Divider().opacity(0.12).padding(.leading, 30) }
+        }
+    }
+    private func rank(_ kind: PKGMetadata.Kind) -> Int { switch kind { case .game: return 0; case .update: return 1; case .dlc: return 2; case .other: return 3 } }
+    private func kindIcon(_ kind: PKGMetadata.Kind) -> String { switch kind { case .game: return "gamecontroller.fill"; case .update: return "arrow.down.circle.fill"; case .dlc: return "puzzlepiece.extension.fill"; case .other: return "shippingbox.fill" } }
+    private func kindName(_ kind: PKGMetadata.Kind) -> String { switch kind { case .game: return t("Base Game", "اللعبة الأساسية"); case .update: return t("Update", "التحديث"); case .dlc: return "DLC"; case .other: return t("Utility", "أداة") } }
+    private func byteString(_ bytes: UInt64) -> String { ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file) }
+}
 
 struct LibraryDetailsOverlay: View {
     @ObservedObject var store: LibraryStore
